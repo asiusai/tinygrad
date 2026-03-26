@@ -282,7 +282,7 @@ class MSMProgram:
 
     # submit
     st = time.perf_counter_ns() if wait else 0
-    submit = msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT(self.dev.fd, flags=msm_drm.MSM_PIPE_3D0 | msm_drm.MSM_SUBMIT_NO_IMPLICIT,
+    submit = msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT(self.dev.fd, flags=msm_drm.MSM_PIPE_3D0,
                                                 nr_bos=len(bo_list), nr_cmds=1,
                                                 bos=ctypes.addressof(submit_bos), cmds=ctypes.addressof(submit_cmds),
                                                 queueid=self.dev.queue_id)
