@@ -57,7 +57,6 @@ class MSMAllocator(LRUAllocator['MSMDevice']):
     msm_drm.DRM_IOCTL_GEM_CLOSE(self.dev.fd, handle=opaque.handle)
 
   def _copyin(self, dest: MSMBuffer, src: memoryview):
-    self.dev.synchronize()
     ctypes.memmove(dest.cpu_addr, mv_address(src), src.nbytes)
 
   def _copyout(self, dest: memoryview, src: MSMBuffer):
@@ -79,6 +78,12 @@ def _build_pm4(prg: MSMProgram, args_buf: MSMBuffer, global_size, local_size) ->
 
   def cast_int(x, ceil=False): return (math.ceil(x) if ceil else int(x)) if isinstance(x, float) else x
   global_size_mp = [cast_int(g * l) for g, l in zip(global_size, local_size)]
+
+  # invalidate caches so GPU sees fresh data from CPU writes
+  cmd(mesa.CP_WAIT_FOR_IDLE)
+  cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_INVALIDATE)
+  cmd(mesa.CP_WAIT_MEM_WRITES)
+  cmd(mesa.CP_WAIT_FOR_IDLE)
 
   # set compute mode
   cmd(mesa.CP_SET_MARKER, qreg.a6xx_cp_set_marker_0(mode=mesa.RM6_COMPUTE))
