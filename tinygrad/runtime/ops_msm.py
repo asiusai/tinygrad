@@ -35,6 +35,9 @@ class MSMBuffer:
   mmap_size: int  # mmap'd size
 
 class MSMAllocator(LRUAllocator['MSMDevice']):
+  def free(self, opaque:Any, size:int, options:BufferSpec|None=None):
+    # always free immediately, never LRU cache. prevents GPU faults from stale IOVA mappings.
+    self._free(opaque, options if options is not None else self.default_buffer_spec)
   def _alloc(self, size: int, options: BufferSpec) -> MSMBuffer:
     alloc_size = round_up(size, 0x1000)
     # allocate GEM buffer
