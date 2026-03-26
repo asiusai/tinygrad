@@ -57,6 +57,7 @@ class MSMAllocator(LRUAllocator['MSMDevice']):
     msm_drm.DRM_IOCTL_GEM_CLOSE(self.dev.fd, handle=opaque.handle)
 
   def _copyin(self, dest: MSMBuffer, src: memoryview):
+    self.dev.synchronize()
     ctypes.memmove(dest.cpu_addr, mv_address(src), src.nbytes)
 
   def _copyout(self, dest: memoryview, src: MSMBuffer):
