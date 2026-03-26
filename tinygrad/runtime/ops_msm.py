@@ -36,21 +36,21 @@ class MSMBuffer:
 
 class MSMAllocator(LRUAllocator['MSMDevice']):
   def _alloc(self, size: int, options: BufferSpec) -> MSMBuffer:
-    size = round_up(size, 0x1000)
+    alloc_size = round_up(size, 0x1000)
     # allocate GEM buffer
     flags = msm_drm.MSM_BO_WC
     if options.cpu_access: flags = msm_drm.MSM_BO_CACHED_COHERENT
-    gem = msm_drm.DRM_IOCTL_MSM_GEM_NEW(self.dev.fd, size=size, flags=flags)
+    gem = msm_drm.DRM_IOCTL_MSM_GEM_NEW(self.dev.fd, size=alloc_size, flags=flags)
     handle = gem.handle
     # get mmap offset
     info = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.dev.fd, handle=handle, info=msm_drm.MSM_INFO_GET_OFFSET)
     mmap_offset = info.value
     # mmap to CPU
-    cpu_addr = self.dev.drm_fd.mmap(0, size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, mmap_offset)
+    cpu_addr = self.dev.drm_fd.mmap(0, alloc_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, mmap_offset)
     # get GPU virtual address (IOVA)
     info2 = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.dev.fd, handle=handle, info=msm_drm.MSM_INFO_GET_IOVA)
     iova = info2.value
-    return MSMBuffer(handle=handle, size=size, iova=iova, cpu_addr=cpu_addr, mmap_size=size)
+    return MSMBuffer(handle=handle, size=size, iova=iova, cpu_addr=cpu_addr, mmap_size=alloc_size)
 
   def _free(self, opaque: MSMBuffer, options: BufferSpec):
     FileIOInterface.munmap(opaque.cpu_addr, opaque.mmap_size)
