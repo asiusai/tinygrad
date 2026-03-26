@@ -35,9 +35,6 @@ class MSMBuffer:
   mmap_size: int  # mmap'd size
 
 class MSMAllocator(LRUAllocator['MSMDevice']):
-  def free(self, opaque:Any, size:int, options:BufferSpec|None=None):
-    # always free immediately, never LRU cache. prevents GPU faults from stale IOVA mappings.
-    self._free(opaque, options if options is not None else self.default_buffer_spec)
   def _alloc(self, size: int, options: BufferSpec) -> MSMBuffer:
     alloc_size = round_up(size, 0x1000)
     # allocate GEM buffer
@@ -163,8 +160,10 @@ def _build_pm4(prg: MSMProgram, args_buf: MSMBuffer, global_size, local_size) ->
   cmd(mesa.CP_EXEC_CS, 0,
       qreg.cp_exec_cs_1(ngroups_x=global_size[0]), qreg.cp_exec_cs_2(ngroups_y=global_size[1]), qreg.cp_exec_cs_3(_ngroups_z=global_size[2]))
 
-  # cache flush
+  # full cache flush: write-back, invalidate, wait for memory writes, wait for idle
   cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_FLUSH_TS, *data64_le(prg.dev.dummy_buf.iova), 0)
+  cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_INVALIDATE)
+  cmd(mesa.CP_WAIT_MEM_WRITES)
   cmd(mesa.CP_WAIT_FOR_IDLE)
 
   return q
