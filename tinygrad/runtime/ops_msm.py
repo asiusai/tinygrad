@@ -288,12 +288,11 @@ class MSMProgram:
                                                 queueid=self.dev.queue_id)
     self.dev.last_fence = submit.fence
 
-    ret = None
-    if wait:
-      self.dev.synchronize()
-      ret = float(time.perf_counter_ns() - st) * 1e-9
+    # synchronize to ensure GPU is done before reusing temp buffers
+    self.dev.synchronize()
+    ret = float(time.perf_counter_ns() - st) * 1e-9 if wait else None
 
-    # free temporary buffers
+    # free temporary buffers (safe now, GPU is done)
     self.dev.allocator.free(args_buf, args_buf.size)
     self.dev.allocator.free(cmd_buf, cmd_buf.size)
     return ret
