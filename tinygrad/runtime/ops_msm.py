@@ -2,11 +2,13 @@ from __future__ import annotations
 import os, ctypes, functools, mmap, struct, array, math, time, glob
 assert os.name == 'posix'
 from dataclasses import dataclass
-from typing import Any
-from tinygrad.device import BufferSpec, Compiled, CompilerSet, LRUAllocator
+from typing import Any, cast
+from tinygrad.device import Buffer, BufferSpec, Compiled, CompilerSet, LRUAllocator
 from tinygrad.runtime.support.hcq import FileIOInterface
 from tinygrad.runtime.autogen import msm_drm, mesa
 from tinygrad.renderer.nir import IR3Renderer
+from tinygrad.engine.jit import GraphRunner
+from tinygrad.engine.realize import CompiledRunner
 from tinygrad.helpers import mv_address, to_mv, round_up, data64_le, next_power2, flatten
 
 # PM4 packet helpers (shared with ops_qcom.py)
@@ -307,6 +309,111 @@ class MSMProgram:
       return float(time.perf_counter_ns() - st) * 1e-9
     return None
 
+class MSMGraph(GraphRunner):
+  def __init__(self, *args, **kwargs):
+    super().__init__(*args, **kwargs)
+    self.dev: MSMDevice = cast(MSMDevice, cast(CompiledRunner, self.jit_cache[0].prg).dev)
+
+    # pre-build PM4 for each kernel in the JIT cache
+    self.pm4_per_kernel: list[tuple[MSMProgram, list[int]]] = []
+    for ji in self.jit_cache:
+      if not isinstance(ji.prg, CompiledRunner): continue
+      prg: MSMProgram = ji.prg._prg
+      bufs = [cast(Buffer, b)._buf for b in ji.bufs]
+      gs, ls = tuple(ji.prg.p.global_size or (1, 1, 1)), tuple(ji.prg.p.local_size or (1, 1, 1))
+      self.pm4_per_kernel.append((prg, self._build_kernel_pm4(prg, bufs, gs, ls)))
+
+    # pre-allocate one big command buffer for the concatenated PM4
+    total_dwords = sum(len(pm4) for _, pm4 in self.pm4_per_kernel)
+    self.cmd_buf: MSMBuffer = self.dev.allocator.alloc(total_dwords * 4)
+
+    # collect all BO handles referenced across all kernels
+    self.all_bo_handles: set[int] = {self.dev.dummy_buf.handle, self.dev._stack.handle, self.dev.border_color_buf.handle, self.cmd_buf.handle}
+    for ji in self.jit_cache:
+      if not isinstance(ji.prg, CompiledRunner): continue
+      for b in ji.bufs:
+        if b is not None: self.all_bo_handles.add(cast(Buffer, b)._buf.handle)
+      self.all_bo_handles.add(ji.prg._prg.lib_buf.handle)
+
+  def _build_kernel_pm4(self, prg: MSMProgram, bufs: list[MSMBuffer], global_size, local_size) -> list[int]:
+    from tinygrad.dtype import ImageDType
+    args_buf: MSMBuffer = self.dev.allocator.alloc(prg.kernargs_alloc_size)
+    ctypes.memset(args_buf.cpu_addr, 0, prg.kernargs_alloc_size)
+    self.all_bo_handles = getattr(self, 'all_bo_handles', set())
+    self.all_bo_handles.add(args_buf.handle)
+
+    ubos = [b for i, b in enumerate(bufs) for _, dt in prg.buf_dtypes[i] if not isinstance(dt, ImageDType)]
+    uavs = [(dt, b) for i, b in enumerate(bufs) for _, dt in prg.buf_dtypes[i] if isinstance(dt, ImageDType)]
+    ibos, texs = uavs[:prg.ibo_cnt], [uavs[prg.ibo_cnt + prg.tex_to_image[i]] for i in range(prg.tex_cnt)]
+
+    for cnst_val, cnst_off, cnst_sz in prg.consts_info:
+      to_mv(args_buf.cpu_addr + cnst_off, cnst_sz)[:] = cnst_val.to_bytes(cnst_sz, byteorder='little')
+    if prg.samp_cnt > 0: to_mv(args_buf.cpu_addr + prg.samp_off, len(prg.samplers) * 4).cast('I')[:] = array.array('I', prg.samplers)
+
+    dummy_iova = self.dev.dummy_buf.iova
+    for i in range(len(bufs) + len(())):
+      struct.pack_into("<Q", to_mv(args_buf.cpu_addr + prg.buf_off + i * 8, 8), 0, dummy_iova)
+    buf_data = struct.pack(f"<{len(ubos)}Q", *[b.iova for b in ubos])
+    to_mv(args_buf.cpu_addr + prg.buf_off, len(buf_data))[:] = buf_data
+
+    def _tex(b, ibo=False):
+      imgdt, buf = b
+      fmt = mesa.FMT6_32_32_32_32_FLOAT if imgdt.itemsize == 4 else mesa.FMT6_16_16_16_16_FLOAT
+      return [qreg.a6xx_tex_const_0(fmt=fmt) if ibo else qreg.a6xx_tex_const_0(0x8, swiz_x=0, swiz_y=1, swiz_z=2, swiz_w=3, fmt=fmt),
+              qreg.a6xx_tex_const_1(width=imgdt.shape[1], height=imgdt.shape[0]),
+              qreg.a6xx_tex_const_2(type=mesa.A6XX_TEX_2D, pitch=imgdt.pitch, pitchalign=_ctz(imgdt.pitch) - 6), 0, *data64_le(buf.iova),
+              qreg.a6xx_tex_const_6(plane_pitch=0x400000), qreg.a6xx_tex_const_7(13), 0, 0, 0, 0, 0, 0, 0, 0]
+    if texs:
+      to_mv(args_buf.cpu_addr + prg.tex_off, len(texs) * 0x40).cast('I')[:] = array.array('I', flatten(map(_tex, texs)))
+    if ibos:
+      ibo_data = array.array('I', flatten(map(functools.partial(_tex, ibo=True), ibos)))
+      to_mv(args_buf.cpu_addr + prg.ibo_off, len(ibo_data) * 4).cast('I')[:] = ibo_data
+
+    return _build_pm4(prg, args_buf, global_size, local_size)
+
+  def __call__(self, input_buffers: list[Buffer], var_vals: dict[str, int], wait=False) -> float | None:
+    # update input buffer handles in BO set
+    for input_idx in self.input_replace.values():
+      self.all_bo_handles.add(input_buffers[input_idx]._buf.handle)
+
+    # concatenate all PM4 into one command buffer
+    offset = 0
+    for _, pm4 in self.pm4_per_kernel:
+      to_mv(self.cmd_buf.cpu_addr + offset, len(pm4) * 4).cast('I')[:] = array.array('I', pm4)
+      offset += len(pm4) * 4
+
+    # build BO table
+    bo_list = list(self.all_bo_handles)
+    submit_bos = (msm_drm.struct_drm_msm_gem_submit_bo * len(bo_list))()
+    for i, h in enumerate(bo_list):
+      submit_bos[i].flags = msm_drm.MSM_SUBMIT_BO_READ | msm_drm.MSM_SUBMIT_BO_WRITE
+      submit_bos[i].handle = h
+      submit_bos[i].presumed = 0
+
+    # single command buffer covering all kernels
+    cmd_idx = bo_list.index(self.cmd_buf.handle)
+    submit_cmds = (msm_drm.struct_drm_msm_gem_submit_cmd * 1)()
+    submit_cmds[0].type = msm_drm.MSM_SUBMIT_CMD_BUF
+    submit_cmds[0].submit_idx = cmd_idx
+    submit_cmds[0].submit_offset = 0
+    submit_cmds[0].size = offset
+    submit_cmds[0].pad = 0
+    submit_cmds[0].nr_relocs = 0
+    submit_cmds[0].iova = self.cmd_buf.iova
+
+    # single submit for all kernels
+    st = time.perf_counter_ns() if wait else 0
+    submit = msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT(self.dev.fd, flags=msm_drm.MSM_PIPE_3D0,
+                                                nr_bos=len(bo_list), nr_cmds=1,
+                                                bos=ctypes.addressof(submit_bos), cmds=ctypes.addressof(submit_cmds),
+                                                queueid=self.dev.queue_id)
+    self.dev.last_fence = submit.fence
+
+    if wait:
+      self.dev.synchronize()
+      return float(time.perf_counter_ns() - st) * 1e-9
+    return None
+
 def _find_msm_device() -> str:
   for path in sorted(glob.glob("/dev/dri/renderD*")):
     try:
@@ -370,7 +477,7 @@ class MSMDevice(Compiled):
     # compilers: IR3 only (no QCOMCLRenderer, that needs KGSL)
     compilers = CompilerSet(cset=[(functools.partial(IR3Renderer, self.chip_id), None)])
 
-    super().__init__(device, allocator, compilers, functools.partial(MSMProgram, self))
+    super().__init__(device, allocator, compilers, functools.partial(MSMProgram, self), graph=MSMGraph)
 
   def _ensure_stack_size(self, sz):
     if not hasattr(self, '_stack'): self._stack = self.allocator.alloc(sz)
