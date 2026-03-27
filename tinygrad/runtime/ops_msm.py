@@ -294,7 +294,7 @@ class MSMProgram:
     submit_cmds[0].nr_relocs = 0
     submit_cmds[0].iova = cmd_buf.iova
 
-    # submit
+    # submit (async, no fence wait - GPU handles ordering via implicit sync)
     st = time.perf_counter_ns() if wait else 0
     submit = msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT(self.dev.fd, flags=msm_drm.MSM_PIPE_3D0,
                                                 nr_bos=len(bo_list), nr_cmds=1,
@@ -302,14 +302,10 @@ class MSMProgram:
                                                 queueid=self.dev.queue_id)
     self.dev.last_fence = submit.fence
 
-    # synchronize to ensure GPU is done before reusing temp buffers
-    self.dev.synchronize()
-    ret = float(time.perf_counter_ns() - st) * 1e-9 if wait else None
-
-    # free temporary buffers (safe now, GPU is done)
-    self.dev.allocator.free(args_buf, args_buf.size)
-    self.dev.allocator.free(cmd_buf, cmd_buf.size)
-    return ret
+    if wait:
+      self.dev.synchronize()
+      return float(time.perf_counter_ns() - st) * 1e-9
+    return None
 
 def _find_msm_device() -> str:
   for path in sorted(glob.glob("/dev/dri/renderD*")):
