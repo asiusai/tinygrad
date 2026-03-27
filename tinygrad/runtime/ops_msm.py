@@ -232,7 +232,12 @@ class MSMProgram:
     # write sampler descriptors
     if self.samp_cnt > 0: to_mv(args_buf.cpu_addr + self.samp_off, len(self.samplers) * 4).cast('I')[:] = array.array('I', self.samplers)
 
-    # write buffer addresses and scalar values
+    # pre-fill UBO region with dummy IOVA to prevent null-pointer GPU faults from unused slots
+    dummy_iova = self.dev.dummy_buf.iova
+    for i in range(len(bufs) + len(vals)):
+      struct.pack_into("<Q", to_mv(args_buf.cpu_addr + self.buf_off + i * 8, 8), 0, dummy_iova)
+
+    # write actual buffer addresses and scalar values (overwrites used slots)
     buf_data = struct.pack(f"<{len(ubos)}Q", *[b.iova for b in ubos])
     to_mv(args_buf.cpu_addr + self.buf_off, len(buf_data))[:] = buf_data
     val_data = struct.pack(f"<{len(vals)}I", *vals)
