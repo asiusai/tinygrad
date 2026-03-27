@@ -312,35 +312,32 @@ class MSMProgram:
 class MSMGraph(GraphRunner):
   def __init__(self, *args, **kwargs):
     super().__init__(*args, **kwargs)
+    from tinygrad.dtype import ImageDType
     self.msm_dev: MSMDevice = cast(MSMDevice, cast(CompiledRunner, self.jit_cache[0].prg).dev)
 
-    # store kernel metadata for rebuilding PM4 on each call (needed because input buffer IOVAs change)
-    self.kernel_info: list[tuple[MSMProgram, list[Buffer], tuple, tuple]] = []
+    # pre-build args buffers, PM4, and track patch locations for input buffer IOVAs
+    self.args_bufs: list[MSMBuffer] = []
+    self.bo_handles: set[int] = {self.msm_dev.dummy_buf.handle, self.msm_dev._stack.handle, self.msm_dev.border_color_buf.handle}
+    # patch_map: (j, i) -> (args_buf_idx, byte_offset_in_args, is_image, tex_descriptor_offset)
+    self.ubo_patches: list[tuple[int, int]] = []  # (args_buf_cpu_addr + offset, for each replaceable UBO slot)
+    self.tex_patches: list[tuple[int, int]] = []  # (args_buf_cpu_addr + offset, for each replaceable texture IOVA)
+    # input_to_patches: input_idx -> list of (addr, is_image) where addr is the cpu address to write the new IOVA
+    self.input_to_patches: dict[int, list[tuple[int, bool]]] = {}
+    all_pm4: list[list[int]] = []
+
+    kernel_idx = 0
     for ji in self.jit_cache:
       if not isinstance(ji.prg, CompiledRunner): continue
-      self.kernel_info.append((ji.prg._prg, list(ji.bufs),
-                               tuple(ji.prg.p.global_size or (1, 1, 1)), tuple(ji.prg.p.local_size or (1, 1, 1))))
+      prg: MSMProgram = ji.prg._prg
+      bufs_raw = [cast(Buffer, b)._buf for b in ji.bufs]
+      gs, ls = tuple(ji.prg.p.global_size or (1, 1, 1)), tuple(ji.prg.p.local_size or (1, 1, 1))
 
-  def __call__(self, input_buffers: list[Buffer], var_vals: dict[str, int], wait=False) -> float | None:
-    from tinygrad.dtype import ImageDType
-
-    # apply input buffer replacements
-    updated_bufs: list[list[Buffer]] = [list(bufs) for _, bufs, _, _ in self.kernel_info]
-    for (j, i), input_idx in self.input_replace.items():
-      if j < len(updated_bufs): updated_bufs[j][i] = input_buffers[input_idx]
-
-    # build PM4 and args for each kernel, collect all BO handles
-    all_pm4: list[list[int]] = []
-    bo_handles: set[int] = {self.msm_dev.dummy_buf.handle, self.msm_dev._stack.handle, self.msm_dev.border_color_buf.handle}
-
-    for idx, (prg, _, gs, ls) in enumerate(self.kernel_info):
-      bufs = [cast(Buffer, b)._buf for b in updated_bufs[idx]]
-      # build args buffer
+      # build args buffer (same as MSMProgram.__call__)
       args_buf: MSMBuffer = self.msm_dev.allocator.alloc(prg.kernargs_alloc_size)
       ctypes.memset(args_buf.cpu_addr, 0, prg.kernargs_alloc_size)
 
-      ubos = [b for i, b in enumerate(bufs) for _, dt in prg.buf_dtypes[i] if not isinstance(dt, ImageDType)]
-      uavs = [(dt, b) for i, b in enumerate(bufs) for _, dt in prg.buf_dtypes[i] if isinstance(dt, ImageDType)]
+      ubos = [b for i, b in enumerate(bufs_raw) for _, dt in prg.buf_dtypes[i] if not isinstance(dt, ImageDType)]
+      uavs = [(dt, b) for i, b in enumerate(bufs_raw) for _, dt in prg.buf_dtypes[i] if isinstance(dt, ImageDType)]
       ibos, texs = uavs[:prg.ibo_cnt], [uavs[prg.ibo_cnt + prg.tex_to_image[i]] for i in range(prg.tex_cnt)]
 
       for cnst_val, cnst_off, cnst_sz in prg.consts_info:
@@ -348,7 +345,7 @@ class MSMGraph(GraphRunner):
       if prg.samp_cnt > 0: to_mv(args_buf.cpu_addr + prg.samp_off, len(prg.samplers) * 4).cast('I')[:] = array.array('I', prg.samplers)
 
       dummy_iova = self.msm_dev.dummy_buf.iova
-      for i in range(len(bufs)):
+      for i in range(len(bufs_raw)):
         struct.pack_into("<Q", to_mv(args_buf.cpu_addr + prg.buf_off + i * 8, 8), 0, dummy_iova)
       buf_data = struct.pack(f"<{len(ubos)}Q", *[b.iova for b in ubos])
       to_mv(args_buf.cpu_addr + prg.buf_off, len(buf_data))[:] = buf_data
@@ -366,37 +363,73 @@ class MSMGraph(GraphRunner):
         ibo_data = array.array('I', flatten(map(functools.partial(_tex, ibo=True), ibos)))
         to_mv(args_buf.cpu_addr + prg.ibo_off, len(ibo_data) * 4).cast('I')[:] = ibo_data
 
-      all_pm4.append(_build_pm4(prg, args_buf, gs, ls))
-      bo_handles.add(args_buf.handle)
-      bo_handles.add(prg.lib_buf.handle)
-      for b in bufs: bo_handles.add(b.handle)
+      # track which input_replace entries map to UBO/texture slots in this args buffer
+      # UBO slot mapping: ubos are packed contiguously, but we need to know which bufs[i] maps to which ubo index
+      ubo_idx = 0
+      for i, b in enumerate(bufs_raw):
+        for _, dt in prg.buf_dtypes[i]:
+          if not isinstance(dt, ImageDType):
+            if (kernel_idx, i) in self.input_replace:
+              input_idx = self.input_replace[(kernel_idx, i)]
+              self.input_to_patches.setdefault(input_idx, []).append((args_buf.cpu_addr + prg.buf_off + ubo_idx * 8, False))
+            ubo_idx += 1
+          else:
+            # image buffer: IOVA is at tex descriptor offset + 16 bytes (dwords 4-5)
+            img_in_uavs = sum(1 for ii in range(i) for _, ddt in prg.buf_dtypes[ii] if isinstance(ddt, ImageDType))
+            if img_in_uavs < prg.ibo_cnt:
+              desc_off = prg.ibo_off + img_in_uavs * 0x40
+            else:
+              tex_idx = img_in_uavs - prg.ibo_cnt
+              desc_off = prg.tex_off + tex_idx * 0x40
+            if (kernel_idx, i) in self.input_replace:
+              input_idx = self.input_replace[(kernel_idx, i)]
+              self.input_to_patches.setdefault(input_idx, []).append((args_buf.cpu_addr + desc_off + 16, True))
 
-    # concatenate PM4 into one command buffer
+      all_pm4.append(_build_pm4(prg, args_buf, gs, ls))
+      self.args_bufs.append(args_buf)
+      self.bo_handles.add(args_buf.handle)
+      self.bo_handles.add(prg.lib_buf.handle)
+      for b in bufs_raw: self.bo_handles.add(b.handle)
+      kernel_idx += 1
+
+    # pre-build the concatenated command buffer
     total_dwords = sum(len(pm4) for pm4 in all_pm4)
-    cmd_buf: MSMBuffer = self.msm_dev.allocator.alloc(total_dwords * 4)
-    bo_handles.add(cmd_buf.handle)
+    self.cmd_buf: MSMBuffer = self.msm_dev.allocator.alloc(total_dwords * 4)
+    self.bo_handles.add(self.cmd_buf.handle)
     offset = 0
     for pm4 in all_pm4:
-      to_mv(cmd_buf.cpu_addr + offset, len(pm4) * 4).cast('I')[:] = array.array('I', pm4)
+      to_mv(self.cmd_buf.cpu_addr + offset, len(pm4) * 4).cast('I')[:] = array.array('I', pm4)
       offset += len(pm4) * 4
+    self.cmd_size = offset
+
+  def __call__(self, input_buffers: list[Buffer], var_vals: dict[str, int], wait=False) -> float | None:
+    # patch input buffer IOVAs in pre-built args buffers
+    for input_idx, patches in self.input_to_patches.items():
+      buf = input_buffers[input_idx]._buf
+      self.bo_handles.add(buf.handle)
+      for addr, is_image in patches:
+        if is_image:
+          struct.pack_into("<II", to_mv(addr, 8), 0, buf.iova & 0xFFFFFFFF, buf.iova >> 32)
+        else:
+          struct.pack_into("<Q", to_mv(addr, 8), 0, buf.iova)
 
     # build BO table and submit
-    bo_list = list(bo_handles)
+    bo_list = list(self.bo_handles)
     submit_bos = (msm_drm.struct_drm_msm_gem_submit_bo * len(bo_list))()
     for i, h in enumerate(bo_list):
       submit_bos[i].flags = msm_drm.MSM_SUBMIT_BO_READ | msm_drm.MSM_SUBMIT_BO_WRITE
       submit_bos[i].handle = h
       submit_bos[i].presumed = 0
 
-    cmd_idx = bo_list.index(cmd_buf.handle)
+    cmd_idx = bo_list.index(self.cmd_buf.handle)
     submit_cmds = (msm_drm.struct_drm_msm_gem_submit_cmd * 1)()
     submit_cmds[0].type = msm_drm.MSM_SUBMIT_CMD_BUF
     submit_cmds[0].submit_idx = cmd_idx
     submit_cmds[0].submit_offset = 0
-    submit_cmds[0].size = offset
+    submit_cmds[0].size = self.cmd_size
     submit_cmds[0].pad = 0
     submit_cmds[0].nr_relocs = 0
-    submit_cmds[0].iova = cmd_buf.iova
+    submit_cmds[0].iova = self.cmd_buf.iova
 
     st = time.perf_counter_ns() if wait else 0
     submit = msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT(self.msm_dev.fd, flags=msm_drm.MSM_PIPE_3D0,
