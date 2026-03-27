@@ -35,29 +35,33 @@ class MSMBuffer:
   mmap_size: int  # mmap'd size
 
 class MSMAllocator(LRUAllocator['MSMDevice']):
-  def free(self, opaque:Any, size:int, options:BufferSpec|None=None):
-    # bypass LRU cache: GEM_CLOSE during LRU eviction unmaps IOVAs causing GPU translation faults
-    self._free(opaque, options if options is not None else self.default_buffer_spec)
+  def __init__(self, dev: 'MSMDevice', **kwargs):
+    super().__init__(dev, **kwargs)
+    self._all_buffers: list[MSMBuffer] = []  # track all GEM BOs, only close on finalize
+
   def _alloc(self, size: int, options: BufferSpec) -> MSMBuffer:
     alloc_size = round_up(size, 0x1000)
-    # allocate GEM buffer
     flags = msm_drm.MSM_BO_WC
     if options.cpu_access: flags = msm_drm.MSM_BO_CACHED_COHERENT
     gem = msm_drm.DRM_IOCTL_MSM_GEM_NEW(self.dev.fd, size=alloc_size, flags=flags)
     handle = gem.handle
-    # get mmap offset
     info = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.dev.fd, handle=handle, info=msm_drm.MSM_INFO_GET_OFFSET)
-    mmap_offset = info.value
-    # mmap to CPU
-    cpu_addr = self.dev.drm_fd.mmap(0, alloc_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, mmap_offset)
-    # get GPU virtual address (IOVA)
+    cpu_addr = self.dev.drm_fd.mmap(0, alloc_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, info.value)
     info2 = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.dev.fd, handle=handle, info=msm_drm.MSM_INFO_GET_IOVA)
-    iova = info2.value
-    return MSMBuffer(handle=handle, size=size, iova=iova, cpu_addr=cpu_addr, mmap_size=alloc_size)
+    buf = MSMBuffer(handle=handle, size=size, iova=info2.value, cpu_addr=cpu_addr, mmap_size=alloc_size)
+    self._all_buffers.append(buf)
+    return buf
 
   def _free(self, opaque: MSMBuffer, options: BufferSpec):
-    FileIOInterface.munmap(opaque.cpu_addr, opaque.mmap_size)
-    msm_drm.DRM_IOCTL_GEM_CLOSE(self.dev.fd, handle=opaque.handle)
+    # never close GEM handles during runtime, IOMMU unmapping races cause GPU translation faults
+    # GEM BOs are closed in finalize() or when the fd is closed at process exit
+    pass
+
+  def finalize(self):
+    for buf in self._all_buffers:
+      if buf.mmap_size > 0: FileIOInterface.munmap(buf.cpu_addr, buf.mmap_size)
+      msm_drm.DRM_IOCTL_GEM_CLOSE(self.dev.fd, handle=buf.handle)
+    self._all_buffers.clear()
 
   def _copyin(self, dest: MSMBuffer, src: memoryview):
     ctypes.memmove(dest.cpu_addr, mv_address(src), src.nbytes)
@@ -386,3 +390,8 @@ class MSMDevice(Compiled):
     try: msm_drm.DRM_IOCTL_MSM_WAIT_FENCE(self.fd, __payload=req)
     except OSError as e:
       if e.errno != 62: raise  # ETIME is ok (already completed)
+
+  def finalize(self):
+    self.synchronize()
+    self.allocator.free_cache()
+    self.allocator.finalize()
