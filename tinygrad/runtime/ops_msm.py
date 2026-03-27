@@ -312,7 +312,7 @@ class MSMProgram:
 class MSMGraph(GraphRunner):
   def __init__(self, *args, **kwargs):
     super().__init__(*args, **kwargs)
-    self.dev: MSMDevice = cast(MSMDevice, cast(CompiledRunner, self.jit_cache[0].prg).dev)
+    self.msm_dev: MSMDevice = cast(MSMDevice, cast(CompiledRunner, self.jit_cache[0].prg).dev)
 
     # pre-build PM4 for each kernel in the JIT cache
     self.pm4_per_kernel: list[tuple[MSMProgram, list[int]]] = []
@@ -325,10 +325,11 @@ class MSMGraph(GraphRunner):
 
     # pre-allocate one big command buffer for the concatenated PM4
     total_dwords = sum(len(pm4) for _, pm4 in self.pm4_per_kernel)
-    self.cmd_buf: MSMBuffer = self.dev.allocator.alloc(total_dwords * 4)
+    self.cmd_buf: MSMBuffer = self.msm_dev.allocator.alloc(total_dwords * 4)
 
     # collect all BO handles referenced across all kernels
-    self.all_bo_handles: set[int] = {self.dev.dummy_buf.handle, self.dev._stack.handle, self.dev.border_color_buf.handle, self.cmd_buf.handle}
+    self.all_bo_handles: set[int] = {self.msm_dev.dummy_buf.handle, self.msm_dev._stack.handle,
+                                     self.msm_dev.border_color_buf.handle, self.cmd_buf.handle}
     for ji in self.jit_cache:
       if not isinstance(ji.prg, CompiledRunner): continue
       for b in ji.bufs:
@@ -337,7 +338,7 @@ class MSMGraph(GraphRunner):
 
   def _build_kernel_pm4(self, prg: MSMProgram, bufs: list[MSMBuffer], global_size, local_size) -> list[int]:
     from tinygrad.dtype import ImageDType
-    args_buf: MSMBuffer = self.dev.allocator.alloc(prg.kernargs_alloc_size)
+    args_buf: MSMBuffer = self.msm_dev.allocator.alloc(prg.kernargs_alloc_size)
     ctypes.memset(args_buf.cpu_addr, 0, prg.kernargs_alloc_size)
     self.all_bo_handles = getattr(self, 'all_bo_handles', set())
     self.all_bo_handles.add(args_buf.handle)
@@ -350,8 +351,8 @@ class MSMGraph(GraphRunner):
       to_mv(args_buf.cpu_addr + cnst_off, cnst_sz)[:] = cnst_val.to_bytes(cnst_sz, byteorder='little')
     if prg.samp_cnt > 0: to_mv(args_buf.cpu_addr + prg.samp_off, len(prg.samplers) * 4).cast('I')[:] = array.array('I', prg.samplers)
 
-    dummy_iova = self.dev.dummy_buf.iova
-    for i in range(len(bufs) + len(())):
+    dummy_iova = self.msm_dev.dummy_buf.iova
+    for i in range(len(bufs)):
       struct.pack_into("<Q", to_mv(args_buf.cpu_addr + prg.buf_off + i * 8, 8), 0, dummy_iova)
     buf_data = struct.pack(f"<{len(ubos)}Q", *[b.iova for b in ubos])
     to_mv(args_buf.cpu_addr + prg.buf_off, len(buf_data))[:] = buf_data
@@ -403,14 +404,14 @@ class MSMGraph(GraphRunner):
 
     # single submit for all kernels
     st = time.perf_counter_ns() if wait else 0
-    submit = msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT(self.dev.fd, flags=msm_drm.MSM_PIPE_3D0,
+    submit = msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT(self.msm_dev.fd, flags=msm_drm.MSM_PIPE_3D0,
                                                 nr_bos=len(bo_list), nr_cmds=1,
                                                 bos=ctypes.addressof(submit_bos), cmds=ctypes.addressof(submit_cmds),
-                                                queueid=self.dev.queue_id)
-    self.dev.last_fence = submit.fence
+                                                queueid=self.msm_dev.queue_id)
+    self.msm_dev.last_fence = submit.fence
 
     if wait:
-      self.dev.synchronize()
+      self.msm_dev.synchronize()
       return float(time.perf_counter_ns() - st) * 1e-9
     return None
 
