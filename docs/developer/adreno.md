@@ -1,4 +1,4 @@
-# Adreno GPU on Mainline Linux (MSM DRM)
+# Adreno GPU
 
 There are two ways to run tinygrad on Qualcomm Adreno GPUs:
 
