@@ -41,19 +41,28 @@ class MSMAllocator(LRUAllocator['MSMDevice']):
     alloc_size = round_up(size, 0x1000)
     flags = msm_drm.MSM_BO_WC
     if options.cpu_access: flags = msm_drm.MSM_BO_CACHED_COHERENT
-    gem = msm_drm.DRM_IOCTL_MSM_GEM_NEW(self.dev.fd, size=alloc_size, flags=flags)
-    handle = gem.handle
-    info = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.dev.fd, handle=handle, info=msm_drm.MSM_INFO_GET_OFFSET)
-    cpu_addr = self.dev.drm_fd.mmap(0, alloc_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, info.value)
-    info2 = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.dev.fd, handle=handle, info=msm_drm.MSM_INFO_GET_IOVA)
-    return MSMBuffer(handle=handle, size=size, iova=info2.value, cpu_addr=cpu_addr, mmap_size=alloc_size)
+    buf = self._gem_alloc(alloc_size, size, flags)
+    # if IOVA is above the valid range, free cached buffers to reclaim IOVA space and retry
+    if buf.iova + alloc_size > self.dev.iova_limit:
+      self._gem_free(buf)
+      self.free_cache()
+      buf = self._gem_alloc(alloc_size, size, flags)
+    return buf
 
-  def _free(self, opaque: MSMBuffer, options: BufferSpec):
-    if opaque.mmap_size > 0: FileIOInterface.munmap(opaque.cpu_addr, opaque.mmap_size)
-    msm_drm.DRM_IOCTL_GEM_CLOSE(self.dev.fd, handle=opaque.handle)
+  def _gem_alloc(self, alloc_size: int, size: int, flags: int) -> MSMBuffer:
+    gem = msm_drm.DRM_IOCTL_MSM_GEM_NEW(self.dev.fd, size=alloc_size, flags=flags)
+    info = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.dev.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_OFFSET)
+    cpu_addr = self.dev.drm_fd.mmap(0, alloc_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, info.value)
+    info2 = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.dev.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_IOVA)
+    return MSMBuffer(handle=gem.handle, size=size, iova=info2.value, cpu_addr=cpu_addr, mmap_size=alloc_size)
+
+  def _gem_free(self, buf: MSMBuffer):
+    if buf.mmap_size > 0: FileIOInterface.munmap(buf.cpu_addr, buf.mmap_size)
+    msm_drm.DRM_IOCTL_GEM_CLOSE(self.dev.fd, handle=buf.handle)
+
+  def _free(self, opaque: MSMBuffer, options: BufferSpec): self._gem_free(opaque)
 
   def free_cache(self):
-    # sync GPU before closing GEM handles to prevent IOMMU TLB faults
     self.dev.synchronize()
     super().free_cache()
 
@@ -479,6 +488,11 @@ class MSMDevice(Compiled):
     self.gpu_id = (self.chip_id >> 24, (self.chip_id >> 16) & 0xFF, (self.chip_id >> 8) & 0xFF)
 
     if self.gpu_id[:2] >= (7, 3): raise RuntimeError(f"Unsupported GPU: chip_id={self.chip_id:#x}")
+
+    # query IOVA range for proactive cache eviction before IOVA exhaustion
+    va_start = msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_VA_START).value
+    va_size = msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_VA_SIZE).value
+    self.iova_limit = va_start + va_size
 
     # create submit queue
     sq = msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_NEW(self.fd, flags=0, prio=1)
