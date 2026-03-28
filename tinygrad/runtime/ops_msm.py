@@ -393,15 +393,43 @@ class MSMGraph(GraphRunner):
       for b in bufs_raw: self.bo_handles.add(b.handle)
       kernel_idx += 1
 
-    # pre-build the concatenated command buffer
+    # pre-build the concatenated command buffer, track chunk boundaries
     total_dwords = sum(len(pm4) for pm4 in all_pm4)
     self.cmd_buf: MSMBuffer = self.msm_dev.allocator.alloc(total_dwords * 4)
     self.bo_handles.add(self.cmd_buf.handle)
+    self.chunk_offsets: list[tuple[int, int]] = []  # (byte_offset, byte_size) per kernel
     offset = 0
     for pm4 in all_pm4:
       to_mv(self.cmd_buf.cpu_addr + offset, len(pm4) * 4).cast('I')[:] = array.array('I', pm4)
+      self.chunk_offsets.append((offset, len(pm4) * 4))
       offset += len(pm4) * 4
-    self.cmd_size = offset
+
+  def _submit_range(self, start_kernel: int, end_kernel: int):
+    """Submit a range of pre-built kernels as a single DRM_MSM_GEM_SUBMIT."""
+    byte_start = self.chunk_offsets[start_kernel][0]
+    byte_end = self.chunk_offsets[end_kernel - 1][0] + self.chunk_offsets[end_kernel - 1][1]
+
+    bo_list = list(self.bo_handles)
+    submit_bos = (msm_drm.struct_drm_msm_gem_submit_bo * len(bo_list))()
+    for i, h in enumerate(bo_list):
+      submit_bos[i].flags = msm_drm.MSM_SUBMIT_BO_READ | msm_drm.MSM_SUBMIT_BO_WRITE
+      submit_bos[i].handle = h
+
+    cmd_idx = bo_list.index(self.cmd_buf.handle)
+    submit_cmds = (msm_drm.struct_drm_msm_gem_submit_cmd * 1)()
+    submit_cmds[0].type = msm_drm.MSM_SUBMIT_CMD_BUF
+    submit_cmds[0].submit_idx = cmd_idx
+    submit_cmds[0].submit_offset = byte_start
+    submit_cmds[0].size = byte_end - byte_start
+    submit_cmds[0].pad = 0
+    submit_cmds[0].nr_relocs = 0
+    submit_cmds[0].iova = self.cmd_buf.iova + byte_start
+
+    submit = msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT(self.msm_dev.fd, flags=msm_drm.MSM_PIPE_3D0,
+                                                nr_bos=len(bo_list), nr_cmds=1,
+                                                bos=ctypes.addressof(submit_bos), cmds=ctypes.addressof(submit_cmds),
+                                                queueid=self.msm_dev.queue_id)
+    self.msm_dev.last_fence = submit.fence
 
   def __call__(self, input_buffers: list[Buffer], var_vals: dict[str, int], wait=False) -> float | None:
     # patch input buffer IOVAs in pre-built args buffers
@@ -414,30 +442,12 @@ class MSMGraph(GraphRunner):
         else:
           struct.pack_into("<Q", to_mv(addr, 8), 0, buf.iova)
 
-    # build BO table and submit
-    bo_list = list(self.bo_handles)
-    submit_bos = (msm_drm.struct_drm_msm_gem_submit_bo * len(bo_list))()
-    for i, h in enumerate(bo_list):
-      submit_bos[i].flags = msm_drm.MSM_SUBMIT_BO_READ | msm_drm.MSM_SUBMIT_BO_WRITE
-      submit_bos[i].handle = h
-      submit_bos[i].presumed = 0
-
-    cmd_idx = bo_list.index(self.cmd_buf.handle)
-    submit_cmds = (msm_drm.struct_drm_msm_gem_submit_cmd * 1)()
-    submit_cmds[0].type = msm_drm.MSM_SUBMIT_CMD_BUF
-    submit_cmds[0].submit_idx = cmd_idx
-    submit_cmds[0].submit_offset = 0
-    submit_cmds[0].size = self.cmd_size
-    submit_cmds[0].pad = 0
-    submit_cmds[0].nr_relocs = 0
-    submit_cmds[0].iova = self.cmd_buf.iova
-
+    # submit in chunks to let the display compositor interleave (no a6xx hardware preemption)
     st = time.perf_counter_ns() if wait else 0
-    submit = msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT(self.msm_dev.fd, flags=msm_drm.MSM_PIPE_3D0,
-                                                nr_bos=len(bo_list), nr_cmds=1,
-                                                bos=ctypes.addressof(submit_bos), cmds=ctypes.addressof(submit_cmds),
-                                                queueid=self.msm_dev.queue_id)
-    self.msm_dev.last_fence = submit.fence
+    n_kernels = len(self.chunk_offsets)
+    chunk_size = max(1, n_kernels // 4)  # ~4 chunks gives compositor 3 scheduling windows
+    for i in range(0, n_kernels, chunk_size):
+      self._submit_range(i, min(i + chunk_size, n_kernels))
 
     if wait:
       self.msm_dev.synchronize()
@@ -494,8 +504,9 @@ class MSMDevice(Compiled):
     va_size = msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_VA_SIZE).value
     self.iova_limit = va_start + va_size
 
-    # create submit queue
-    sq = msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_NEW(self.fd, flags=0, prio=1)
+    # create submit queue at lowest priority so display compositor isn't starved
+    num_prios = msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_PRIORITIES).value
+    sq = msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_NEW(self.fd, flags=0, prio=max(0, num_prios - 1))
     self.queue_id = sq.id
     self.last_fence = 0
 
