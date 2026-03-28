@@ -37,10 +37,6 @@ class MSMBuffer:
   mmap_size: int  # mmap'd size
 
 class MSMAllocator(LRUAllocator['MSMDevice']):
-  def __init__(self, dev: 'MSMDevice', **kwargs):
-    super().__init__(dev, **kwargs)
-    self._all_buffers: list[MSMBuffer] = []  # track all GEM BOs, only close on finalize
-
   def _alloc(self, size: int, options: BufferSpec) -> MSMBuffer:
     alloc_size = round_up(size, 0x1000)
     flags = msm_drm.MSM_BO_WC
@@ -50,20 +46,16 @@ class MSMAllocator(LRUAllocator['MSMDevice']):
     info = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.dev.fd, handle=handle, info=msm_drm.MSM_INFO_GET_OFFSET)
     cpu_addr = self.dev.drm_fd.mmap(0, alloc_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, info.value)
     info2 = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.dev.fd, handle=handle, info=msm_drm.MSM_INFO_GET_IOVA)
-    buf = MSMBuffer(handle=handle, size=size, iova=info2.value, cpu_addr=cpu_addr, mmap_size=alloc_size)
-    self._all_buffers.append(buf)
-    return buf
+    return MSMBuffer(handle=handle, size=size, iova=info2.value, cpu_addr=cpu_addr, mmap_size=alloc_size)
 
   def _free(self, opaque: MSMBuffer, options: BufferSpec):
-    # never close GEM handles during runtime, IOMMU unmapping races cause GPU translation faults
-    # GEM BOs are closed in finalize() or when the fd is closed at process exit
-    pass
+    if opaque.mmap_size > 0: FileIOInterface.munmap(opaque.cpu_addr, opaque.mmap_size)
+    msm_drm.DRM_IOCTL_GEM_CLOSE(self.dev.fd, handle=opaque.handle)
 
-  def finalize(self):
-    for buf in self._all_buffers:
-      if buf.mmap_size > 0: FileIOInterface.munmap(buf.cpu_addr, buf.mmap_size)
-      msm_drm.DRM_IOCTL_GEM_CLOSE(self.dev.fd, handle=buf.handle)
-    self._all_buffers.clear()
+  def free_cache(self):
+    # sync GPU before closing GEM handles to prevent IOMMU TLB faults
+    self.dev.synchronize()
+    super().free_cache()
 
   def _copyin(self, dest: MSMBuffer, src: memoryview):
     ctypes.memmove(dest.cpu_addr, mv_address(src), src.nbytes)
@@ -526,4 +518,3 @@ class MSMDevice(Compiled):
   def finalize(self):
     self.synchronize()
     self.allocator.free_cache()
-    self.allocator.finalize()
