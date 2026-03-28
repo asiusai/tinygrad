@@ -1,6 +1,14 @@
-# MSM DRM Runtime
+# Adreno GPU on Mainline Linux (MSM DRM)
 
-MSM DRM runtime targets Qualcomm Adreno GPUs on mainline Linux via the upstream DRM driver (`/dev/dri/renderD*`). This is the counterpart to the QCOM runtime which uses Android's KGSL driver (`/dev/kgsl-3d0`).
+There are two ways to run tinygrad on Qualcomm Adreno GPUs:
+
+| | `DEV=QCOM` | `DEV=MSM` |
+|---|---|---|
+| Kernel driver | KGSL (`/dev/kgsl-3d0`) | MSM DRM (`/dev/dri/renderD*`) |
+| Found on | Android, Qualcomm vendor kernels | Mainline/upstream Linux |
+| Shader compiler | OpenCL (default) or IR3 (`QCOM_IR3=1`) | IR3 only |
+
+Use `DEV=QCOM` if you have `/dev/kgsl-3d0` (Android devices, comma body). Use `DEV=MSM` if you have `/dev/dri/renderD*` with an Adreno GPU (mainline Linux kernel).
 
 ## How to run?
 
@@ -12,7 +20,7 @@ Requirements:
 
 * Linux kernel with `CONFIG_DRM_MSM=y` (GPU support, not just display)
 * Adreno a6xx GPU (tested: Adreno 630 / SDM845)
-* `libtinymesa.so` built from Mesa (provides the IR3 shader compiler)
+* `libtinymesa.so` built from Mesa (provides the IR3 shader compiler, used by both `QCOM_IR3=1` and `DEV=MSM`)
 
 ## Architecture
 
