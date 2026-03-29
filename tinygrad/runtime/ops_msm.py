@@ -41,30 +41,16 @@ class MSMAllocator(LRUAllocator['MSMDevice']):
     alloc_size = round_up(size, 0x1000)
     flags = msm_drm.MSM_BO_WC
     if options.cpu_access: flags = msm_drm.MSM_BO_CACHED_COHERENT
-    buf = self._gem_alloc(alloc_size, size, flags)
-    # if IOVA is above the valid range, free cached buffers to reclaim IOVA space and retry
-    if buf.iova + alloc_size > self.dev.iova_limit:
-      self._gem_free(buf)
-      self.free_cache()
-      buf = self._gem_alloc(alloc_size, size, flags)
-    return buf
-
-  def _gem_alloc(self, alloc_size: int, size: int, flags: int) -> MSMBuffer:
     gem = msm_drm.DRM_IOCTL_MSM_GEM_NEW(self.dev.fd, size=alloc_size, flags=flags)
     info = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.dev.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_OFFSET)
     cpu_addr = self.dev.drm_fd.mmap(0, alloc_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, info.value)
     info2 = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.dev.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_IOVA)
     return MSMBuffer(handle=gem.handle, size=size, iova=info2.value, cpu_addr=cpu_addr, mmap_size=alloc_size)
 
-  def _gem_free(self, buf: MSMBuffer):
-    if buf.mmap_size > 0: FileIOInterface.munmap(buf.cpu_addr, buf.mmap_size)
-    msm_drm.DRM_IOCTL_GEM_CLOSE(self.dev.fd, handle=buf.handle)
-
-  def _free(self, opaque: MSMBuffer, options: BufferSpec): self._gem_free(opaque)
-
-  def free_cache(self):
-    self.dev.synchronize()
-    super().free_cache()
+  def _free(self, opaque: MSMBuffer, options: BufferSpec):
+    # GEM_CLOSE unmaps IOVA from IOMMU but GPU TLB retains stale entries, causing translation faults.
+    # with 48-bit SMMU VA space (262TB), we can safely leak handles until process exit.
+    pass
 
   def _copyin(self, dest: MSMBuffer, src: memoryview):
     ctypes.memmove(dest.cpu_addr, mv_address(src), src.nbytes)
@@ -499,11 +485,6 @@ class MSMDevice(Compiled):
 
     if self.gpu_id[:2] >= (7, 3): raise RuntimeError(f"Unsupported GPU: chip_id={self.chip_id:#x}")
 
-    # query IOVA range for proactive cache eviction before IOVA exhaustion
-    va_start = msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_VA_START).value
-    va_size = msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_VA_SIZE).value
-    self.iova_limit = va_start + va_size
-
     # create submit queue at lowest priority so display compositor isn't starved
     num_prios = msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_PRIORITIES).value
     sq = msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_NEW(self.fd, flags=0, prio=max(0, num_prios - 1))
@@ -542,4 +523,3 @@ class MSMDevice(Compiled):
 
   def finalize(self):
     self.synchronize()
-    self.allocator.free_cache()
