@@ -1,7 +1,7 @@
 from typing import TypeVar, Generic, Callable, cast, Any
 import functools, collections
 from tinygrad.tensor import Tensor
-from tinygrad.helpers import flatten, merge_dicts, DEBUG, Context, BEAM, getenv, colored, JIT, JIT_BATCH_SIZE, dedup, unwrap, pluralize
+from tinygrad.helpers import flatten, merge_dicts, DEBUG, Context, BEAM, getenv, colored, JIT, JIT_BATCH_SIZE, dedup, unwrap, pluralize, PROFILE
 from tinygrad.device import Buffer, Compiled, Device, MultiBuffer
 from tinygrad.dtype import DType
 from tinygrad.uop.ops import UOp, Variable, sym_infer, Ops, buffers, track_rewrites
@@ -201,6 +201,7 @@ class CapturedJit(Generic[ReturnType]):
     self._jit_cache: list[ExecItem] = self.jit_cache
     self._input_replace: dict[tuple[int, int], int] = self.input_replace
     self._first_run = True
+    self._fast_jit_data: list|None = None  # pre-computed fast dispatch data
     # precompute read-after-write hazard detection
     self._output_to_writer = {b: j for j, ei in enumerate(self.jit_cache) for b in get_out_buffers_for_ei(ei)}
     self._input_to_max_reader: dict[int, int] = {}
@@ -256,9 +257,170 @@ class CapturedJit(Generic[ReturnType]):
       self._first_run = False
 
     if DEBUG >= 1 and len(self._jit_cache) >= 10: print(f"jit execs {len(self._jit_cache)} kernels")
-    for ei in self._jit_cache: ei.run(var_vals, jit=True)
+    if self._fast_jit_data is None and not (DEBUG >= 2) and not PROFILE and not getenv("NO_FAST_JIT"):
+      self._fast_jit_data = self._build_fast_dispatch(var_vals)
+    if self._fast_jit_data is not None:
+      self._run_fast_dispatch(var_vals)
+    else:
+      for ei in self._jit_cache: ei.run(var_vals, jit=True)
     self._clear_inputs()
     return self.ret
+
+  def _build_fast_dispatch(self, var_vals: dict[str, int]) -> list:
+    """Build data for two-phase C dispatch: first frame sets all args, subsequent frames set only changed args."""
+    import ctypes, os
+    from tinygrad.dtype import ImageDType
+    lib_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'cl_dispatch.so')
+    if not os.path.exists(lib_path): lib_path = '/data/openpilot/tinygrad_repo/cl_dispatch.so'
+    try: clib = ctypes.CDLL(lib_path)
+    except OSError: return None
+    clib.dispatch_batch.restype = ctypes.c_int
+    clib.dispatch_batch.argtypes = [
+      ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint),
+      ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_int),
+      ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_void_p),
+      ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+    clib.dispatch_fast.restype = ctypes.c_int
+    clib.dispatch_fast.argtypes = [
+      ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint),
+      ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_int),
+      ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_void_p)]
+    queue = None
+    kernels_list, ndims_list, gs_flat, ls_flat, has_local_list = [], [], [], [], []
+    buf_counts_list, buf_indices_flat, buf_ei_map_flat = [], [], []
+    val_counts_list, val_indices_flat, val_values_flat = [], [], []
+    non_kernel_items = []
+    kernel_ei_refs = []
+    buf_offset, val_offset = 0, 0
+    buf_offsets_list, val_offsets_list = [], []
+    for j, ei in enumerate(self._jit_cache):
+      if not isinstance(ei.prg, CompiledRunner):
+        non_kernel_items.append((j, ei))
+        continue
+      cl_prg = ei.prg._prg
+      if queue is None: queue = cl_prg.dev.queue
+      merged = var_vals | ei.fixedvars if ei.fixedvars else var_vals
+      gs, ls = ei.prg.p.launch_dims(merged)
+      if ls is not None: gs = [int(g*l) for g,l in zip(gs, ls)]
+      ndim = len(gs)
+      kernels_list.append(ctypes.cast(cl_prg.kernel, ctypes.c_void_p).value)
+      ndims_list.append(ndim)
+      gs_flat.extend([gs[0], gs[1] if ndim > 1 else 1, gs[2] if ndim > 2 else 1])
+      if ls: ls_flat.extend([ls[0], ls[1] if ndim > 1 else 0, ls[2] if ndim > 2 else 0])
+      else: ls_flat.extend([0, 0, 0])
+      has_local_list.append(1 if ls else 0)
+      glob_idx = ei.prg.p.globals
+      bi, bm = [], []
+      for k, ei_bufs_idx in enumerate(glob_idx):
+        for real_i, dt in cl_prg.arg_dtypes[k]:
+          if not isinstance(dt, ImageDType):
+            bi.append(real_i)
+            bm.append(ei_bufs_idx)
+      buf_offsets_list.append(buf_offset)
+      buf_counts_list.append(len(bi))
+      buf_indices_flat.extend(bi)
+      buf_ei_map_flat.extend(bm)
+      buf_offset += len(bi)
+      vi, vv = [], []
+      if ei.prg.p.vars:
+        for vii, v in enumerate(ei.prg.p.vars):
+          vi.append(len(glob_idx) + vii)
+          vv.append(merged.get(v.expr, v.vmin))
+      val_offsets_list.append(val_offset)
+      val_counts_list.append(len(vi))
+      val_indices_flat.extend(vi)
+      val_values_flat.extend(vv)
+      val_offset += len(vi)
+      kernel_ei_refs.append(ei)
+    n_k = len(kernels_list)
+    n_b = len(buf_indices_flat)
+    n_v = len(val_indices_flat)
+    c_kernels = (ctypes.c_void_p * n_k)(*kernels_list)
+    c_ndims = (ctypes.c_uint * n_k)(*ndims_list)
+    c_gs = (ctypes.c_size_t * (n_k*3))(*gs_flat)
+    c_ls = (ctypes.c_size_t * (n_k*3))(*ls_flat)
+    c_has_local = (ctypes.c_int * n_k)(*has_local_list)
+    c_buf_counts = (ctypes.c_int * n_k)(*buf_counts_list)
+    c_buf_offsets = (ctypes.c_int * n_k)(*buf_offsets_list)
+    c_buf_indices = (ctypes.c_int * max(n_b, 1))(*buf_indices_flat)
+    c_buf_values = (ctypes.c_void_p * max(n_b, 1))()
+    for bp in range(n_b):
+      k_idx = 0
+      while k_idx < n_k - 1 and buf_offsets_list[k_idx+1] <= bp: k_idx += 1
+      b = kernel_ei_refs[k_idx].bufs[buf_ei_map_flat[bp]]
+      c_buf_values[bp] = ctypes.cast(b._buf, ctypes.c_void_p).value if b else 0
+    changing = set(self._input_replace.keys())
+    jit_to_kernel = {}
+    ki = 0
+    for j, ei in enumerate(self._jit_cache):
+      if isinstance(ei.prg, CompiledRunner):
+        jit_to_kernel[j] = ki
+        ki += 1
+    # build arrays for dispatch_fast: (kernel_index_in_c, cl_arg_index, ei_ref_k_idx, ei_bufs_idx)
+    changing_entries = []
+    for bp in range(n_b):
+      k_idx = 0
+      while k_idx < n_k - 1 and buf_offsets_list[k_idx+1] <= bp: k_idx += 1
+      ei_bufs_idx = buf_ei_map_flat[bp]
+      for jj, kk in jit_to_kernel.items():
+        if kk == k_idx:
+          if (jj, ei_bufs_idx) in changing:
+            changing_entries.append((k_idx, buf_indices_flat[bp], k_idx, ei_bufs_idx))
+          break
+    n_ch = len(changing_entries)
+    c_ch_kernel_indices = (ctypes.c_int * max(n_ch, 1))(*[e[0] for e in changing_entries])
+    c_ch_arg_indices = (ctypes.c_int * max(n_ch, 1))(*[e[1] for e in changing_entries])
+    c_ch_values = (ctypes.c_void_p * max(n_ch, 1))()
+    c_val_counts = (ctypes.c_int * n_k)(*val_counts_list)
+    c_val_offsets = (ctypes.c_int * n_k)(*val_offsets_list)
+    c_val_indices = (ctypes.c_int * max(n_v, 1))(*val_indices_flat)
+    c_val_values = (ctypes.c_int * max(n_v, 1))(*val_values_flat)
+    queue_ptr = ctypes.cast(queue, ctypes.c_void_p).value
+    # store ei_ref info for changing entries
+    ch_ei_info = [(e[2], e[3]) for e in changing_entries]
+    return [clib, queue_ptr, n_k, c_kernels, c_ndims, c_gs, c_ls, c_has_local,
+            c_buf_counts, c_buf_offsets, c_buf_indices, c_buf_values, kernel_ei_refs,
+            c_val_counts, c_val_offsets, c_val_indices, c_val_values, non_kernel_items,
+            n_ch, c_ch_kernel_indices, c_ch_arg_indices, c_ch_values, ch_ei_info,
+            True]  # last element: needs_full_init
+
+  def _run_fast_dispatch(self, var_vals: dict[str, int]):
+    """Two-phase dispatch: first call sets all args, subsequent calls set only changed args (~18 of 748)."""
+    import ctypes
+    data = self._fast_jit_data
+    (clib, queue_ptr, n_k, c_kernels, c_ndims, c_gs, c_ls, c_has_local,
+     c_buf_counts, c_buf_offsets, c_buf_indices, c_buf_values, kernel_ei_refs,
+     c_val_counts, c_val_offsets, c_val_indices, c_val_values, non_kernel_items,
+     n_ch, c_ch_kernel_indices, c_ch_arg_indices, c_ch_values, ch_ei_info,
+     needs_full_init) = data
+    for j, ei in non_kernel_items:
+      ei.run(var_vals, jit=True)
+    _cast = ctypes.cast
+    _cvp = ctypes.c_void_p
+    if needs_full_init:
+      # first frame: update all changing buf values in the full array, then dispatch_batch (sets all 748 args)
+      for i, (k_idx, ei_bufs_idx) in enumerate(ch_ei_info):
+        b = kernel_ei_refs[k_idx].bufs[ei_bufs_idx]
+        # find the flat position for this entry — scan buf_ei_map to match
+        bo = c_buf_offsets[k_idx]
+        bc = c_buf_counts[k_idx]
+        for bp_off in range(bc):
+          if c_buf_indices[bo + bp_off] == c_ch_arg_indices[i]:
+            c_buf_values[bo + bp_off] = _cast(b._buf, _cvp).value if b else 0
+            break
+      err = clib.dispatch_batch(queue_ptr, n_k, c_kernels, c_ndims, c_gs, c_ls, c_has_local,
+                                 c_buf_counts, c_buf_offsets, c_buf_indices, c_buf_values,
+                                 c_val_counts, c_val_offsets, c_val_indices, c_val_values)
+      if err != 0: raise RuntimeError(f"dispatch_batch error: {err}")
+      data[-1] = False  # next call uses dispatch_fast
+    else:
+      # subsequent frames: only set changed args, then enqueue all
+      for i, (k_idx, ei_bufs_idx) in enumerate(ch_ei_info):
+        b = kernel_ei_refs[k_idx].bufs[ei_bufs_idx]
+        c_ch_values[i] = _cast(b._buf, _cvp).value if b else 0
+      err = clib.dispatch_fast(queue_ptr, n_k, c_kernels, c_ndims, c_gs, c_ls, c_has_local,
+                                n_ch, c_ch_kernel_indices, c_ch_arg_indices, c_ch_values)
+      if err != 0: raise RuntimeError(f"dispatch_fast error: {err}")
 
 def _prepare_jit_inputs(args, kwargs):
   input_tensors: list[tuple[int|str, Tensor]] = [(name,t) for name,t in list(enumerate(args))+sorted(kwargs.items()) if t.__class__ is Tensor]
@@ -305,6 +467,33 @@ class TinyJit(Generic[ReturnType]):
   def input_replace(self) -> dict[tuple[int, int], int]: return self.captured._input_replace if self.captured is not None else {}
 
   def __get__(self, obj, objtype): return functools.partial(self.__call__, obj) # add support for instance methods
+
+  def _fast_prepare_inputs(self, args, kwargs):
+    """Fast path for JIT exec: extract buffers directly, skip UOp operations."""
+    assert self.captured is not None
+    # extract tensors in same order as _prepare_jit_inputs
+    input_tensors = [(name,t) for name,t in list(enumerate(args))+sorted(kwargs.items()) if t.__class__ is Tensor]
+    names = [name for name,_ in input_tensors]
+    tensors = [t for _,t in input_tensors]
+    for x in args + tuple(kwargs.values()):
+      it = x if isinstance(x, (tuple,list)) else x.values() if isinstance(x, dict) else []
+      tensors += [t for t in it if t.__class__ is Tensor and not any(t is y for y in tensors)]
+    # extract buffers directly (skip UOp substitute/unbind which is expensive)
+    input_buffers = []
+    for t in tensors:
+      if t.uop.op is Ops.MULTI:
+        for u in t.uop.src:
+          if u.base.realized is not None:
+            b = u.base.realized
+            if isinstance(b, MultiBuffer): input_buffers.extend(b.bufs)
+            else: input_buffers.append(b)
+      else:
+        if t.uop.base.realized is not None:
+          b = t.uop.base.realized
+          if isinstance(b, MultiBuffer): input_buffers.extend(b.bufs)
+          else: input_buffers.append(b)
+    # return cached expected_input_info (it doesn't change between calls)
+    return input_buffers, {}, names, self.captured.expected_input_info
 
   def __call__(self, *args, **kwargs) -> ReturnType:
     input_buffers, var_vals, names, expected_input_info = _prepare_jit_inputs(args, kwargs)
