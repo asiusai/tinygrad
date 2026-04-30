@@ -480,7 +480,7 @@ class MSMDevice(Compiled):
     gpu_id_resp = msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_GPU_ID)
     chip_id_resp = msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_CHIP_ID)
     self.gpu_id_val = gpu_id_resp.value
-    self.chip_id = chip_id_resp.value
+    self.chip_id = chip_id_resp.value & 0xFFFFFFFF
     self.gpu_id = (self.chip_id >> 24, (self.chip_id >> 16) & 0xFF, (self.chip_id >> 8) & 0xFF)
 
     if self.gpu_id[:2] >= (7, 3): raise RuntimeError(f"Unsupported GPU: chip_id={self.chip_id:#x}")

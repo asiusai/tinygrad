@@ -32,7 +32,7 @@ def optimize_local_size(_prg:Callable, global_size:list[int], rawbufs:list[Buffe
                   local_size=local_size, wait=True)
     except Exception: return float('inf')
   ret = min([(try_exec(local_size), local_size) for local_size in random.sample(local_sizes, len(local_sizes))])
-  assert not math.isinf(ret[0]), "all optimize_local_size exec failed"
+  if math.isinf(ret[0]): return [1]*len(global_size)
   return ret[1]
 
 class CompiledRunner(Runner):

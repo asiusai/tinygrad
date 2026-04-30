@@ -202,6 +202,7 @@ class CapturedJit(Generic[ReturnType]):
     self._input_replace: dict[tuple[int, int], int] = self.input_replace
     self._first_run = True
     self._fast_jit_data: list|None = None  # pre-computed fast dispatch data
+    self._alias_scratch: dict[int, Buffer] = {}
     # precompute read-after-write hazard detection
     self._output_to_writer = {b: j for j, ei in enumerate(self.jit_cache) for b in get_out_buffers_for_ei(ei)}
     self._input_to_max_reader: dict[int, int] = {}
@@ -228,14 +229,29 @@ class CapturedJit(Generic[ReturnType]):
   # jit exec
   def __call__(self, input_buffers:list[Buffer], var_vals:dict[str, int]) -> ReturnType:
     # assign inputs
-    for idx, offset, device, size, dtype in self.extra_view_inputs:
-      input_buffers.append(Buffer(device, size, dtype, base=input_buffers[idx], offset=offset).ensure_allocated())
+    if not hasattr(self, '_view_cache'): self._view_cache: dict[int, Buffer] = {}
+    for vi, (idx, offset, device, size, dtype) in enumerate(self.extra_view_inputs):
+      cached = self._view_cache.get(vi)
+      if cached is not None and cached._base is input_buffers[idx]:
+        input_buffers.append(cached)
+      else:
+        buf = Buffer(device, size, dtype, base=input_buffers[idx], offset=offset).ensure_allocated()
+        self._view_cache[vi] = buf
+        input_buffers.append(buf)
 
     # copy aliased inputs to prevent read-after-write hazard
     for i, ib in enumerate(input_buffers):
       if (writer := self._output_to_writer.get(ib)) is not None and self._input_to_max_reader.get(i, -1) >= writer:
-        input_buffers[i] = Buffer(ib.device, ib.size, ib.dtype).ensure_allocated().copyin(ib.as_memoryview())
-
+        scratch = self._alias_scratch.get(i)
+        if scratch is None or scratch.size != ib.size or scratch.dtype != ib.dtype:
+          scratch = Buffer(ib.device, ib.size, ib.dtype).ensure_allocated()
+          self._alias_scratch[i] = scratch
+        try:
+          from tinygrad.runtime.autogen import opencl as _cl
+          _cl.clEnqueueCopyBuffer(Device[ib.device].queue, ib._buf[0], scratch._buf[0], 0, 0, ib.nbytes, 0, None, None)
+        except Exception:
+          scratch.copyin(ib.as_memoryview())
+        input_buffers[i] = scratch
     for (j,i),input_idx in self._input_replace.items(): self._jit_cache[j].bufs[i] = input_buffers[input_idx]
 
     # Condense the items into a graph executor.
@@ -385,7 +401,6 @@ class CapturedJit(Generic[ReturnType]):
             True]  # last element: needs_full_init
 
   def _run_fast_dispatch(self, var_vals: dict[str, int]):
-    """Two-phase dispatch: first call sets all args, subsequent calls set only changed args (~18 of 748)."""
     import ctypes
     data = self._fast_jit_data
     (clib, queue_ptr, n_k, c_kernels, c_ndims, c_gs, c_ls, c_has_local,
@@ -397,30 +412,40 @@ class CapturedJit(Generic[ReturnType]):
       ei.run(var_vals, jit=True)
     _cast = ctypes.cast
     _cvp = ctypes.c_void_p
+    for i, (k_idx, ei_bufs_idx) in enumerate(ch_ei_info):
+      b = kernel_ei_refs[k_idx].bufs[ei_bufs_idx]
+      bo = c_buf_offsets[k_idx]
+      bc = c_buf_counts[k_idx]
+      for bp_off in range(bc):
+        if c_buf_indices[bo + bp_off] == c_ch_arg_indices[i]:
+          c_buf_values[bo + bp_off] = _cast(b._buf, _cvp).value if b else 0
+          break
+    if not hasattr(clib, '_smart_setup'):
+      clib.dispatch_smart.restype = ctypes.c_int
+      clib.dispatch_smart.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint),
+        ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+      clib._smart_setup = True
     if needs_full_init:
-      # first frame: update all changing buf values in the full array, then dispatch_batch (sets all 748 args)
-      for i, (k_idx, ei_bufs_idx) in enumerate(ch_ei_info):
-        b = kernel_ei_refs[k_idx].bufs[ei_bufs_idx]
-        # find the flat position for this entry — scan buf_ei_map to match
-        bo = c_buf_offsets[k_idx]
-        bc = c_buf_counts[k_idx]
-        for bp_off in range(bc):
-          if c_buf_indices[bo + bp_off] == c_ch_arg_indices[i]:
-            c_buf_values[bo + bp_off] = _cast(b._buf, _cvp).value if b else 0
-            break
-      err = clib.dispatch_batch(queue_ptr, n_k, c_kernels, c_ndims, c_gs, c_ls, c_has_local,
-                                 c_buf_counts, c_buf_offsets, c_buf_indices, c_buf_values,
-                                 c_val_counts, c_val_offsets, c_val_indices, c_val_values)
-      if err != 0: raise RuntimeError(f"dispatch_batch error: {err}")
-      data[-1] = False  # next call uses dispatch_fast
+      err = clib.dispatch_smart(queue_ptr, n_k, c_kernels, c_ndims, c_gs, c_ls, c_has_local,
+                                c_buf_counts, c_buf_offsets, c_buf_indices, c_buf_values,
+                                None,
+                                c_val_counts, c_val_offsets, c_val_indices, c_val_values)
+      if err != 0: raise RuntimeError(f"dispatch_smart error: {err}")
+      n_b = sum(c_buf_counts[k] for k in range(n_k))
+      self._prev_buf_values = (ctypes.c_void_p * n_b)()
+      for i in range(n_b): self._prev_buf_values[i] = c_buf_values[i]
+      data[-1] = False
     else:
-      # subsequent frames: only set changed args, then enqueue all
-      for i, (k_idx, ei_bufs_idx) in enumerate(ch_ei_info):
-        b = kernel_ei_refs[k_idx].bufs[ei_bufs_idx]
-        c_ch_values[i] = _cast(b._buf, _cvp).value if b else 0
-      err = clib.dispatch_fast(queue_ptr, n_k, c_kernels, c_ndims, c_gs, c_ls, c_has_local,
-                                n_ch, c_ch_kernel_indices, c_ch_arg_indices, c_ch_values)
-      if err != 0: raise RuntimeError(f"dispatch_fast error: {err}")
+      err = clib.dispatch_smart(queue_ptr, n_k, c_kernels, c_ndims, c_gs, c_ls, c_has_local,
+                                c_buf_counts, c_buf_offsets, c_buf_indices, c_buf_values,
+                                self._prev_buf_values,
+                                c_val_counts, c_val_offsets, c_val_indices, c_val_values)
+      if err != 0: raise RuntimeError(f"dispatch_smart error: {err}")
+
 
 def _prepare_jit_inputs(args, kwargs):
   input_tensors: list[tuple[int|str, Tensor]] = [(name,t) for name,t in list(enumerate(args))+sorted(kwargs.items()) if t.__class__ is Tensor]
@@ -496,6 +521,13 @@ class TinyJit(Generic[ReturnType]):
     return input_buffers, {}, names, self.captured.expected_input_info
 
   def __call__(self, *args, **kwargs) -> ReturnType:
+    if self.cnt >= 2 and self.captured is not None:
+      if not hasattr(self, '_cached_inputs'):
+        input_buffers, var_vals, _, _ = self._fast_prepare_inputs(args, kwargs)
+        self._cached_inputs = (input_buffers, var_vals)
+      ret = self.captured(list(self._cached_inputs[0]), self._cached_inputs[1])
+      self.cnt += 1
+      return ret
     input_buffers, var_vals, names, expected_input_info = _prepare_jit_inputs(args, kwargs)
     if not JIT or self.cnt == 0:
       # jit ignore

@@ -47,14 +47,6 @@ class CLProgram:
     check(binary_status.value)
     check(cl.clBuildProgram(self.program, 1, device.device_id, None, BP_CB(), None)) # NOTE: OSX requires this
     self.kernel = checked(cl.clCreateKernel(self.program, name.encode(), status := ctypes.c_int32()), status)
-    self._cached_buf_ids: list[int]|None = None  # cached buf identities for arg skipping
-    self._cached_global_size: tuple|None = None
-    self._cached_local_size: tuple|None = None
-    self._has_images = any(isinstance(dt, ImageDType) for dtlist in arg_dtypes for _, dt in dtlist) if arg_dtypes else False
-    # pre-compute flat arg index mapping: buf_position -> list of (real_kernel_arg_index, is_image)
-    self._flat_arg_map: list[list[tuple[int, bool]]] = []
-    for dtlist in arg_dtypes:
-      self._flat_arg_map.append([(real_i, isinstance(dt, ImageDType)) for real_i, dt in dtlist])
 
   def __del__(self):
     try: check(cl.clReleaseKernel(self.kernel))
@@ -62,23 +54,15 @@ class CLProgram:
     try: check(cl.clReleaseProgram(self.program))
     except (TypeError, AttributeError): pass
 
-  def fast_enqueue(self, bufs, changed_indices, gs_arr, ls_arr, ndim):
-    """Minimal dispatch: only set changed buf args, use pre-computed size arrays, skip error checks."""
-    kernel = self.kernel
-    arg_map = self._flat_arg_map
-    _clSetKernelArg = cl.clSetKernelArg
-    _sizeof = ctypes.sizeof
-    _byref = ctypes.byref
-    for i in changed_indices:
-      b = bufs[i]
-      for real_i, _ in arg_map[i]:
-        _clSetKernelArg(kernel, real_i, _sizeof(b), _byref(b))
-    cl.clEnqueueNDRangeKernel(self.dev.queue, kernel, ndim, None, gs_arr, ls_arr, 0, None, None)
-
   def __call__(self, *bufs:cl.cl_mem, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]|None=None, vals:tuple[int, ...]=(),
                wait=False, **kw) -> float|None:
     i = 0
+    if not hasattr(self, '_prev_bufs'): self._prev_bufs = [None] * 16
+    prev = self._prev_bufs
     for i,b in enumerate(bufs):
+      if i < len(prev) and prev[i] is b: continue
+      if i >= len(prev): prev.extend([None] * (i + 1 - len(prev)))
+      prev[i] = b
       for real_i, dt in self.arg_dtypes[i]:
         if isinstance(dt, ImageDType):
           fmt = cl.cl_image_format(cl.CL_RGBA, {2:cl.CL_HALF_FLOAT, 4:cl.CL_FLOAT}[dt.itemsize])
@@ -88,21 +72,37 @@ class CLProgram:
         else: check(cl.clSetKernelArg(self.kernel, real_i, ctypes.sizeof(b), ctypes.byref(b)))
     for i,v in enumerate(vals,start=i+1): check(cl.clSetKernelArg(self.kernel, i, 4, ctypes.byref(ctypes.c_int32(v))))
     if local_size is not None: global_size = cast(tuple[int,int,int], tuple(int(g*l) for g,l in zip(global_size, local_size)))
+    cache_key = (global_size, local_size)
+    if not hasattr(self, '_size_cache_key') or self._size_cache_key != cache_key:
+      ndim = len(global_size)
+      self._gs_arr = (ctypes.c_size_t * ndim)(*global_size)
+      self._ls_arr = (ctypes.c_size_t * ndim)(*local_size) if local_size else None
+      self._ndim = ndim
+      self._size_cache_key = cache_key
+    if wait and self.dev.is_rusticl:
+      import time as _time
+      check(cl.clEnqueueNDRangeKernel(self.dev.queue, self.kernel, self._ndim, None, self._gs_arr,
+                                      self._ls_arr, 0, None, None))
+      _t0 = _time.perf_counter()
+      check(cl.clFinish(self.dev.queue))
+      return _time.perf_counter() - _t0
     event = cl.cl_event() if wait else None
-    # cache for future fast-path calls
-    if not self._has_images:
-      self._cached_buf_ids = [id(b) for b in bufs]
-      self._cached_global_size = global_size
-      self._gs_arr = (ctypes.c_size_t * len(global_size))(*global_size)
-      self._ls_arr = (ctypes.c_size_t * len(local_size))(*local_size) if local_size else None
-    check(cl.clEnqueueNDRangeKernel(self.dev.queue, self.kernel, len(global_size), None, (ctypes.c_size_t * len(global_size))(*global_size),
-                                    (ctypes.c_size_t * len(local_size))(*local_size) if local_size else None, 0, None, event))
+    check(cl.clEnqueueNDRangeKernel(self.dev.queue, self.kernel, self._ndim, None, self._gs_arr,
+                                    self._ls_arr, 0, None, event))
+    if not wait:
+      self.dev._flush_counter = getattr(self.dev, '_flush_counter', 0) + 1
+      if self.dev._flush_counter % 6 == 0: cl.clFlush(self.dev.queue)
     if wait:
       assert event is not None
+      import time as _time
+      _t0 = _time.perf_counter()
       check(cl.clWaitForEvents(1, event))
-      check(cl.clGetEventProfilingInfo(event, cl.CL_PROFILING_COMMAND_START, 8, ctypes.byref(start := ctypes.c_uint64()), None))
-      check(cl.clGetEventProfilingInfo(event, cl.CL_PROFILING_COMMAND_END, 8, ctypes.byref(end := ctypes.c_uint64()), None))
-      return float(end.value-start.value) * OSX_TIMING_RATIO * 1e-9
+      _t1 = _time.perf_counter()
+      start, end = ctypes.c_uint64(), ctypes.c_uint64()
+      if cl.clGetEventProfilingInfo(event, cl.CL_PROFILING_COMMAND_START, 8, ctypes.byref(start), None) == 0 and \
+         cl.clGetEventProfilingInfo(event, cl.CL_PROFILING_COMMAND_END, 8, ctypes.byref(end), None) == 0:
+        return float(end.value-start.value) * OSX_TIMING_RATIO * 1e-9
+      return _t1 - _t0
     return None
 
 class CLAllocator(LRUAllocator['CLDevice']):
@@ -138,7 +138,9 @@ class CLDevice(Compiled):
                                               buf:=ctypes.create_string_buffer(256), None), buf.value.decode())[1]
     if DEBUG >= 1: print(f"CLDevice: opening {self.device_name} with version {self.driver_version}")
     self.context = checked(cl.clCreateContext(None, 1, self.device_id, CC_CB(), None, status := ctypes.c_int32()), status)
-    self.queue = checked(cl.clCreateCommandQueue(self.context, self.device_id, cl.CL_QUEUE_PROFILING_ENABLE, status), status)
+    self.is_rusticl = "FD" in self.device_name or "Adreno" in self.device_name or "Mali" in self.device_name
+    queue_flags = 0 if self.is_rusticl else cl.CL_QUEUE_PROFILING_ENABLE
+    self.queue = checked(cl.clCreateCommandQueue(self.context, self.device_id, queue_flags, status), status)
     self.pending_copyin: list[memoryview] = []
     self.device_exts = (cl.clGetDeviceInfo(self.device_id, cl.CL_DEVICE_EXTENSIONS, 4096,
                                            ctypes.byref(buf := ctypes.create_string_buffer(4096)),
