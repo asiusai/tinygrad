@@ -332,7 +332,7 @@ class Scheduler:
 
 def bufs_from_ast(ast:UOp, dname:str) -> list[Buffer]:
   glbls = sorted([x for x in ast.backward_slice if x.op is Ops.PARAM], key=lambda x: x.arg)
-  return [Buffer(dname, x.ptrdtype.size, x.dtype.base if not isinstance(x.dtype, ImageDType) else x.dtype) for x in glbls]
+  return [Buffer(dname, x.ptrdtype.size, x.dtype.base) for x in glbls]
 
 def apply_opts(ast:UOp, ren:Renderer) -> UOp:
   if ast.tag is not None: return ast
@@ -353,17 +353,21 @@ def apply_opts(ast:UOp, ren:Renderer) -> UOp:
       k = hand_coded_optimizations(k)
   return k.get_optimized_ast(name_override=ast.arg.name if ast.arg is not None and ast.arg.name != "test" else None)
 
-# max image width: 16384 * 4 = 65536. with real 2d images the real max size is 4 * 16384 ** 2
-def _valid_image_dt(dt): return dt.base in (dtypes.half, dtypes.float) and not isinstance(dt, ImageDType) and dt.size <= 65536 and dt.nbytes()%64 == 0
 def make_image(pa, off, idx):
-  if (idx.tag is None or idx.tag) and _valid_image_dt(dt:=pa.dtype):
-    return idx.replace(src=(pa.replace(dtype=(dtypes.imageh if dt.base==dtypes.half else dtypes.imagef)((1, dt.size // 4, 4), dt.nbytes())), off),
-                       dtype=dtypes.float if dt.base == dtypes.half else idx.dtype)
+  if not isinstance(dt:=pa.dtype, ImageDType) and (idx.tag is None or idx.tag) and (shapes:=ImageDType.valid_dims(dt)):
+    new_pa = pa.replace(dtype=(dtypes.imageh if dt.base==dtypes.half else dtypes.imagef)(shapes[0] + (4,)))
+    new_idx = idx.replace(src=(new_pa, off), dtype=dtypes.float if dt.base == dtypes.half else idx.dtype)
+    return new_idx if idx.tag or dt.base == dtypes.float else new_idx.cast(dtypes.half)
 
 pm_make_images = PatternMatcher([
   # ensure we dont create an unfoldable image store
   (UPat(Ops.STORE, src=(UPat.var("idx"),), allow_any_len=True, name="st"), lambda idx,st:
    st.replace(src=(idx.rtag(is_image:=any(c.op is Ops.RANGE and (c.vmax+1)%4 == 0 for c in idx.src[1].get_idx().split_uop(Ops.ADD))),
-                   st.src[1].cast(dtypes.float if is_image and _valid_image_dt(idx.src[0].dtype) else idx.dtype.base)))),
+                   st.src[1].cast(dtypes.float if is_image and ImageDType.valid_dims(idx.src[0].dtype) else idx.dtype.base)))),
   (UPat(Ops.INDEX, src=(UPat(Ops.PARAM, name="pa"), UPat.var("off")), name="idx"), make_image),
+  # remove double cast from image loads / stores
+  (UPat(Ops.INDEX, src=(UPat(Ops.PARAM, name="pa"),), allow_any_len=True, name="idx").cast(dtypes.half).cast(dtypes.float), lambda idx,pa:
+   idx if isinstance(pa.dtype, ImageDType) else None),
+  (UPat(Ops.STORE, src=(UPat(Ops.PARAM, name="pa").index(UPat()), UPat.var("val").cast(dtypes.half).cast(dtypes.float)), name="st"), lambda st,pa,val:
+   st.replace(src=(st.src[0], val)) if isinstance(pa.dtype, ImageDType) else None),
 ])

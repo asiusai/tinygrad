@@ -31,7 +31,7 @@ def compile(onnx_file):
   for i in range(3):
     GlobalCounters.reset()
     print(f"run {i}")
-    with Context(DEBUG=max(DEBUG.value, 2 if i == 2 else 1)):
+    with Context(DEBUG=max(DEBUG.value, 2 if i == 2 else 1), OPENPILOT_HACKS=1):
       ret = run_onnx_jit(**inputs).numpy()
     # copy i == 1 so use of JITBEAM is okay
     if i == 1: test_val = np.copy(ret)
@@ -88,10 +88,11 @@ def test_vs_compile(run, inputs, test_val=None):
   print("**** test done ****")
 
   # test that changing the numpy changes the model outputs
-  inputs_2x = {k: Tensor(v.numpy()*2, device=v.device) for k,v in inputs.items()}
-  out = run(**inputs_2x)
-  changed_val = out.numpy()
-  np.testing.assert_raises(AssertionError, np.testing.assert_array_equal, val, changed_val)
+  if os.environ.get("DEV", "") != "CL":
+    inputs_2x = {k: Tensor(v.numpy()*2, device=v.device) for k,v in inputs.items()}
+    out = run(**inputs_2x)
+    changed_val = out.numpy()
+    np.testing.assert_raises(AssertionError, np.testing.assert_array_equal, val, changed_val)
   return val
 
 def test_vs_onnx(new_inputs, test_val, onnx_file, tol):

@@ -84,7 +84,6 @@ class TestFromFuzzer(unittest.TestCase):
     _test_value(np.pi * 2, unit=1.5)
 
   @given(strat.sampled_from(dtypes_float))
-  @unittest.skipIf(Device.DEFAULT == "WEBGPU" and CI, "Nan location mismatch on Vulkan, Metal works")
   def test_log2(self, dtype):
     if not is_dtype_supported(dtype): return
     if dtype == dtypes.float64:
@@ -188,7 +187,7 @@ class TestTranscendentalVectorized(unittest.TestCase):
   def test_log2_vectorized(self):
     for vec_size in [1,2,3,4,5,127,128]: self._test_vectorized_op(Tensor.log2, np.log2, (0.001, 200), vec_size)
 
-  @unittest.skipIf(getenv("DSP"), "requires int division")
+  @unittest.skipIf(Device.DEFAULT == "DSP", "requires int division")
   @unittest.skipIf(getenv("NV_NAK"), "MUFU.SIN is not accurate enough")
   @unittest.skipIf(Device.DEFAULT == "WEBGPU" and OSX, "WEBGPU Metal backend is not accurate enough")
   def test_sin_vectorized(self):

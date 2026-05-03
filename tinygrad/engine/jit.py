@@ -1,16 +1,30 @@
 from typing import TypeVar, Generic, Callable, cast, Any
 import functools, collections
 from tinygrad.tensor import Tensor
-from tinygrad.helpers import flatten, merge_dicts, DEBUG, Context, BEAM, getenv, colored, JIT, JIT_BATCH_SIZE, dedup, partition, unwrap
+from tinygrad.helpers import flatten, merge_dicts, DEBUG, Context, BEAM, getenv, colored, JIT, JIT_BATCH_SIZE, dedup, unwrap, pluralize, PROFILE
 from tinygrad.device import Buffer, Compiled, Device, MultiBuffer
 from tinygrad.dtype import DType
-from tinygrad.uop.ops import UOp, Variable, sym_infer, Ops
+from tinygrad.uop.ops import UOp, Variable, sym_infer, Ops, buffers, track_rewrites
 from tinygrad.engine.realize import ExecItem, capturing, ViewOp, BufferCopy, BufferXfer, EncDec, CompiledRunner, Runner, Estimates
-from tinygrad.engine.memory import _internal_memory_planner
+from tinygrad.engine.memory import memory_plan_rewrite, _collect_bufs
+from tinygrad.engine.schedule import linear_to_schedule
 from tinygrad.nn.state import get_parameters
 from tinygrad.schedule.rangeify import mop_cleanup
-from dataclasses import dataclass, replace
-from weakref import WeakKeyDictionary
+from dataclasses import dataclass
+
+def prune_linear(linear:UOp, needed:set[UOp]) -> tuple[UOp, UOp]:
+  kept, onetime = [], []
+  for si in linear.src:
+    si_bufs = {b for src in si.src[1:] for b in _collect_bufs(src)}
+    if not si_bufs.isdisjoint(needed):
+      kept.append(si)
+      needed |= si_bufs
+    else: onetime.append(si)
+  return linear.replace(src=tuple(kept)), linear.replace(src=tuple(onetime))
+
+@track_rewrites(lambda linear,held_bufs,ret: f"JIT {pluralize('Kernel', len(ret))}")
+def jit_lower(linear:UOp, held_bufs:set[UOp]) -> list[ExecItem]:
+  return [ei.lower() for ei in linear_to_schedule(memory_plan_rewrite(linear, held_bufs))]
 
 class GraphException(Exception): pass
 class JitError(Exception): pass
@@ -114,9 +128,9 @@ class GraphRunner(Runner):
           assert ji.prg.p.local_size is not None
           self.launch_dims_base[j] = (tuple(ji.prg.p.global_size), tuple(ji.prg.p.local_size))
 
-    # used in MultiGraphRunner. the ints are id() of _bufs
-    self.w_dependency_map: dict[int, Any] = {}
-    self.r_dependency_map: dict[int, list[Any]] = collections.defaultdict(list)
+    # used in MultiGraphRunner. tracks (offset, end, dep) ranges per base buffer id to handle suballocated buffers correctly.
+    self.w_dependency_map: dict[int, list[tuple[int, int, Any]]] = collections.defaultdict(list)
+    self.r_dependency_map: dict[int, list[tuple[int, int, Any]]] = collections.defaultdict(list)
 
     assert jit_cache[0].prg is not None
     super().__init__(colored(f"<batched {len(jit_cache)}>", "cyan"), jit_cache[0].prg.device.split(":")[0], estimates.simplify())
@@ -132,19 +146,22 @@ class GraphRunner(Runner):
       yield j, (dims[gl] if gl is not None else self.launch_dims_base[j][0]), (dims[lc] if lc is not None else self.launch_dims_base[j][1])
 
   def _access_resources(self, bufs:list[Buffer], write:list[int], new_dependency:Any):
-    # To synchronize access to resources, we monitor the necessary prerequisites for accessing each resource,
-    # whether for write or read operations. A resource can be accessed by either a single writer or multiple readers.
     wait_nodes = []
-
     for i,buf in enumerate(bufs):
-      if id(buf.base._buf) in self.w_dependency_map: wait_nodes.append(self.w_dependency_map[id(buf.base._buf)])
+      key, s, e = id(buf.base._buf), buf.offset, buf.offset + buf.nbytes
+      wait_nodes += [dep for st,en,dep in self.w_dependency_map[key] if st < e and s < en]
+      if i in write: wait_nodes += [dep for st,en,dep in self.r_dependency_map[key] if st < e and s < en]
+    for i,buf in enumerate(bufs):
+      key, s, e = id(buf.base._buf), buf.offset, buf.offset + buf.nbytes
       if i in write:
-        if id(buf.base._buf) in self.r_dependency_map: wait_nodes.extend(self.r_dependency_map.pop(id(buf.base._buf)))
-
-    for i,buf in enumerate(bufs):
-      if i in write: self.w_dependency_map[id(buf.base._buf)] = new_dependency
-      else: self.r_dependency_map[id(buf.base._buf)].append(new_dependency)
-
+        for dmap in [self.w_dependency_map, self.r_dependency_map]:
+          kept = []
+          for st,en,dep in dmap[key]:
+            if st < min(s, en): kept.append((st, min(s, en), dep))
+            if max(e, st) < en: kept.append((max(e, st), en, dep))
+          dmap[key] = kept
+        self.w_dependency_map[key].append((s, e, new_dependency))
+      else: self.r_dependency_map[key].append((s, e, new_dependency))
     return list({id(x):x for x in wait_nodes}.values())
 
   @staticmethod
@@ -177,13 +194,15 @@ class CapturedJit(Generic[ReturnType]):
   expected_input_info: list[tuple[UOp, tuple[Variable, ...], DType, str]]  # (view, variables, dtype, device) per input
 
   def __reduce__(self):
-    # TODO: free_intermediates here? replan_buffers_memory_layout here?
+    # TODO: free_intermediates here?
     return self.__class__, (self.ret, self.jit_cache, self.input_replace, self.extra_view_inputs, self.expected_names, self.expected_input_info)
 
   def __post_init__(self):
     self._jit_cache: list[ExecItem] = self.jit_cache
     self._input_replace: dict[tuple[int, int], int] = self.input_replace
     self._first_run = True
+    self._fast_jit_data: list|None = None  # pre-computed fast dispatch data
+    self._alias_scratch: dict[int, Buffer] = {}
     # precompute read-after-write hazard detection
     self._output_to_writer = {b: j for j, ei in enumerate(self.jit_cache) for b in get_out_buffers_for_ei(ei)}
     self._input_to_max_reader: dict[int, int] = {}
@@ -199,31 +218,40 @@ class CapturedJit(Generic[ReturnType]):
   def free_intermediates(self):
     depends: set[Buffer|None] = set([None])
     update_depends(depends, self.jit_cache)
-    for b in depends:
-      if b is not None:
-        if b.is_allocated(): b.deallocate()
-        if b._base is not None and b._base.allocated_views == 0 and b._base.is_allocated(): b._base.deallocate()
-    self.__post_init__()   # reset the graph state
-
-  def replan_buffers_memory_layout(self):
-    blacklist = [t.uop.buffer for t in get_parameters(self.ret)]
-    asgn = _internal_memory_planner([[b for item in self.jit_cache for b in item.bufs if b is not None and b not in blacklist]], ignore_checks=True)
-    self.jit_cache = [replace(item, bufs=[asgn.get(b,b) if b is not None else None for b in item.bufs]) for item in self.jit_cache]
-    for old, new in asgn.items():
-      if old.is_allocated(): new.ensure_allocated().copyin(old.as_memoryview())
+    arenas = {b._base for b in depends if b is not None and b._base is not None}
+    to_free = {b for b in depends if b is not None} | {b for ei in self.jit_cache for b in ei.bufs if b is not None and b._base in arenas}
+    for b in to_free:
+      if hasattr(b, '_buf'): b.deallocate()
+    for a in arenas:
+      if a.allocated_views == 0 and a.is_allocated(): a.deallocate()
     self.__post_init__()
 
   # jit exec
   def __call__(self, input_buffers:list[Buffer], var_vals:dict[str, int]) -> ReturnType:
     # assign inputs
-    for idx, offset, device, size, dtype in self.extra_view_inputs:
-      input_buffers.append(Buffer(device, size, dtype, base=input_buffers[idx], offset=offset).ensure_allocated())
+    if not hasattr(self, '_view_cache'): self._view_cache: dict[int, Buffer] = {}
+    for vi, (idx, offset, device, size, dtype) in enumerate(self.extra_view_inputs):
+      cached = self._view_cache.get(vi)
+      if cached is not None and cached._base is input_buffers[idx]:
+        input_buffers.append(cached)
+      else:
+        buf = Buffer(device, size, dtype, base=input_buffers[idx], offset=offset).ensure_allocated()
+        self._view_cache[vi] = buf
+        input_buffers.append(buf)
 
     # copy aliased inputs to prevent read-after-write hazard
     for i, ib in enumerate(input_buffers):
       if (writer := self._output_to_writer.get(ib)) is not None and self._input_to_max_reader.get(i, -1) >= writer:
-        input_buffers[i] = Buffer(ib.device, ib.size, ib.dtype).ensure_allocated().copyin(ib.as_memoryview())
-
+        scratch = self._alias_scratch.get(i)
+        if scratch is None or scratch.size != ib.size or scratch.dtype != ib.dtype:
+          scratch = Buffer(ib.device, ib.size, ib.dtype).ensure_allocated()
+          self._alias_scratch[i] = scratch
+        try:
+          from tinygrad.runtime.autogen import opencl as _cl
+          _cl.clEnqueueCopyBuffer(Device[ib.device].queue, ib._buf[0], scratch._buf[0], 0, 0, ib.nbytes, 0, None, None)
+        except Exception:
+          scratch.copyin(ib.as_memoryview())
+        input_buffers[i] = scratch
     for (j,i),input_idx in self._input_replace.items(): self._jit_cache[j].bufs[i] = input_buffers[input_idx]
 
     # Condense the items into a graph executor.
@@ -245,9 +273,179 @@ class CapturedJit(Generic[ReturnType]):
       self._first_run = False
 
     if DEBUG >= 1 and len(self._jit_cache) >= 10: print(f"jit execs {len(self._jit_cache)} kernels")
-    for ei in self._jit_cache: ei.run(var_vals, jit=True)
+    if self._fast_jit_data is None and not (DEBUG >= 2) and not PROFILE and not getenv("NO_FAST_JIT"):
+      self._fast_jit_data = self._build_fast_dispatch(var_vals)
+    if self._fast_jit_data is not None:
+      self._run_fast_dispatch(var_vals)
+    else:
+      for ei in self._jit_cache: ei.run(var_vals, jit=True)
     self._clear_inputs()
     return self.ret
+
+  def _build_fast_dispatch(self, var_vals: dict[str, int]) -> list:
+    """Build data for two-phase C dispatch: first frame sets all args, subsequent frames set only changed args."""
+    import ctypes, os
+    from tinygrad.dtype import ImageDType
+    lib_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'cl_dispatch.so')
+    if not os.path.exists(lib_path): lib_path = '/data/openpilot/tinygrad_repo/cl_dispatch.so'
+    try: clib = ctypes.CDLL(lib_path)
+    except OSError: return None
+    clib.dispatch_batch.restype = ctypes.c_int
+    clib.dispatch_batch.argtypes = [
+      ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint),
+      ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_int),
+      ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_void_p),
+      ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+    clib.dispatch_fast.restype = ctypes.c_int
+    clib.dispatch_fast.argtypes = [
+      ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint),
+      ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_int),
+      ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_void_p)]
+    queue = None
+    kernels_list, ndims_list, gs_flat, ls_flat, has_local_list = [], [], [], [], []
+    buf_counts_list, buf_indices_flat, buf_ei_map_flat = [], [], []
+    val_counts_list, val_indices_flat, val_values_flat = [], [], []
+    non_kernel_items = []
+    kernel_ei_refs = []
+    buf_offset, val_offset = 0, 0
+    buf_offsets_list, val_offsets_list = [], []
+    for j, ei in enumerate(self._jit_cache):
+      if not isinstance(ei.prg, CompiledRunner):
+        non_kernel_items.append((j, ei))
+        continue
+      cl_prg = ei.prg._prg
+      if queue is None: queue = cl_prg.dev.queue
+      merged = var_vals | ei.fixedvars if ei.fixedvars else var_vals
+      gs, ls = ei.prg.p.launch_dims(merged)
+      if ls is not None: gs = [int(g*l) for g,l in zip(gs, ls)]
+      ndim = len(gs)
+      kernels_list.append(ctypes.cast(cl_prg.kernel, ctypes.c_void_p).value)
+      ndims_list.append(ndim)
+      gs_flat.extend([gs[0], gs[1] if ndim > 1 else 1, gs[2] if ndim > 2 else 1])
+      if ls: ls_flat.extend([ls[0], ls[1] if ndim > 1 else 0, ls[2] if ndim > 2 else 0])
+      else: ls_flat.extend([0, 0, 0])
+      has_local_list.append(1 if ls else 0)
+      glob_idx = ei.prg.p.globals
+      bi, bm = [], []
+      for k, ei_bufs_idx in enumerate(glob_idx):
+        for real_i, dt in cl_prg.arg_dtypes[k]:
+          if not isinstance(dt, ImageDType):
+            bi.append(real_i)
+            bm.append(ei_bufs_idx)
+      buf_offsets_list.append(buf_offset)
+      buf_counts_list.append(len(bi))
+      buf_indices_flat.extend(bi)
+      buf_ei_map_flat.extend(bm)
+      buf_offset += len(bi)
+      vi, vv = [], []
+      if ei.prg.p.vars:
+        for vii, v in enumerate(ei.prg.p.vars):
+          vi.append(len(glob_idx) + vii)
+          vv.append(merged.get(v.expr, v.vmin))
+      val_offsets_list.append(val_offset)
+      val_counts_list.append(len(vi))
+      val_indices_flat.extend(vi)
+      val_values_flat.extend(vv)
+      val_offset += len(vi)
+      kernel_ei_refs.append(ei)
+    n_k = len(kernels_list)
+    n_b = len(buf_indices_flat)
+    n_v = len(val_indices_flat)
+    c_kernels = (ctypes.c_void_p * n_k)(*kernels_list)
+    c_ndims = (ctypes.c_uint * n_k)(*ndims_list)
+    c_gs = (ctypes.c_size_t * (n_k*3))(*gs_flat)
+    c_ls = (ctypes.c_size_t * (n_k*3))(*ls_flat)
+    c_has_local = (ctypes.c_int * n_k)(*has_local_list)
+    c_buf_counts = (ctypes.c_int * n_k)(*buf_counts_list)
+    c_buf_offsets = (ctypes.c_int * n_k)(*buf_offsets_list)
+    c_buf_indices = (ctypes.c_int * max(n_b, 1))(*buf_indices_flat)
+    c_buf_values = (ctypes.c_void_p * max(n_b, 1))()
+    for bp in range(n_b):
+      k_idx = 0
+      while k_idx < n_k - 1 and buf_offsets_list[k_idx+1] <= bp: k_idx += 1
+      b = kernel_ei_refs[k_idx].bufs[buf_ei_map_flat[bp]]
+      c_buf_values[bp] = ctypes.cast(b._buf, ctypes.c_void_p).value if b else 0
+    changing = set(self._input_replace.keys())
+    jit_to_kernel = {}
+    ki = 0
+    for j, ei in enumerate(self._jit_cache):
+      if isinstance(ei.prg, CompiledRunner):
+        jit_to_kernel[j] = ki
+        ki += 1
+    # build arrays for dispatch_fast: (kernel_index_in_c, cl_arg_index, ei_ref_k_idx, ei_bufs_idx)
+    changing_entries = []
+    for bp in range(n_b):
+      k_idx = 0
+      while k_idx < n_k - 1 and buf_offsets_list[k_idx+1] <= bp: k_idx += 1
+      ei_bufs_idx = buf_ei_map_flat[bp]
+      for jj, kk in jit_to_kernel.items():
+        if kk == k_idx:
+          if (jj, ei_bufs_idx) in changing:
+            changing_entries.append((k_idx, buf_indices_flat[bp], k_idx, ei_bufs_idx))
+          break
+    n_ch = len(changing_entries)
+    c_ch_kernel_indices = (ctypes.c_int * max(n_ch, 1))(*[e[0] for e in changing_entries])
+    c_ch_arg_indices = (ctypes.c_int * max(n_ch, 1))(*[e[1] for e in changing_entries])
+    c_ch_values = (ctypes.c_void_p * max(n_ch, 1))()
+    c_val_counts = (ctypes.c_int * n_k)(*val_counts_list)
+    c_val_offsets = (ctypes.c_int * n_k)(*val_offsets_list)
+    c_val_indices = (ctypes.c_int * max(n_v, 1))(*val_indices_flat)
+    c_val_values = (ctypes.c_int * max(n_v, 1))(*val_values_flat)
+    queue_ptr = ctypes.cast(queue, ctypes.c_void_p).value
+    # store ei_ref info for changing entries
+    ch_ei_info = [(e[2], e[3]) for e in changing_entries]
+    return [clib, queue_ptr, n_k, c_kernels, c_ndims, c_gs, c_ls, c_has_local,
+            c_buf_counts, c_buf_offsets, c_buf_indices, c_buf_values, kernel_ei_refs,
+            c_val_counts, c_val_offsets, c_val_indices, c_val_values, non_kernel_items,
+            n_ch, c_ch_kernel_indices, c_ch_arg_indices, c_ch_values, ch_ei_info,
+            True]  # last element: needs_full_init
+
+  def _run_fast_dispatch(self, var_vals: dict[str, int]):
+    import ctypes
+    data = self._fast_jit_data
+    (clib, queue_ptr, n_k, c_kernels, c_ndims, c_gs, c_ls, c_has_local,
+     c_buf_counts, c_buf_offsets, c_buf_indices, c_buf_values, kernel_ei_refs,
+     c_val_counts, c_val_offsets, c_val_indices, c_val_values, non_kernel_items,
+     n_ch, c_ch_kernel_indices, c_ch_arg_indices, c_ch_values, ch_ei_info,
+     needs_full_init) = data
+    for j, ei in non_kernel_items:
+      ei.run(var_vals, jit=True)
+    _cast = ctypes.cast
+    _cvp = ctypes.c_void_p
+    for i, (k_idx, ei_bufs_idx) in enumerate(ch_ei_info):
+      b = kernel_ei_refs[k_idx].bufs[ei_bufs_idx]
+      bo = c_buf_offsets[k_idx]
+      bc = c_buf_counts[k_idx]
+      for bp_off in range(bc):
+        if c_buf_indices[bo + bp_off] == c_ch_arg_indices[i]:
+          c_buf_values[bo + bp_off] = _cast(b._buf, _cvp).value if b else 0
+          break
+    if not hasattr(clib, '_smart_setup'):
+      clib.dispatch_smart.restype = ctypes.c_int
+      clib.dispatch_smart.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint),
+        ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+      clib._smart_setup = True
+    if needs_full_init:
+      err = clib.dispatch_smart(queue_ptr, n_k, c_kernels, c_ndims, c_gs, c_ls, c_has_local,
+                                c_buf_counts, c_buf_offsets, c_buf_indices, c_buf_values,
+                                None,
+                                c_val_counts, c_val_offsets, c_val_indices, c_val_values)
+      if err != 0: raise RuntimeError(f"dispatch_smart error: {err}")
+      n_b = sum(c_buf_counts[k] for k in range(n_k))
+      self._prev_buf_values = (ctypes.c_void_p * n_b)()
+      for i in range(n_b): self._prev_buf_values[i] = c_buf_values[i]
+      data[-1] = False
+    else:
+      err = clib.dispatch_smart(queue_ptr, n_k, c_kernels, c_ndims, c_gs, c_ls, c_has_local,
+                                c_buf_counts, c_buf_offsets, c_buf_indices, c_buf_values,
+                                self._prev_buf_values,
+                                c_val_counts, c_val_offsets, c_val_indices, c_val_values)
+      if err != 0: raise RuntimeError(f"dispatch_smart error: {err}")
+
 
 def _prepare_jit_inputs(args, kwargs):
   input_tensors: list[tuple[int|str, Tensor]] = [(name,t) for name,t in list(enumerate(args))+sorted(kwargs.items()) if t.__class__ is Tensor]
@@ -269,25 +467,14 @@ def _prepare_jit_inputs(args, kwargs):
   return input_buffers, var_vals, names, expected_input_info
 
 class TinyJit(Generic[ReturnType]):
-  def __init__(self, fxn:Callable[..., ReturnType]|None, captured:CapturedJit|None=None, prune=False, optimize=False):
+  def __init__(self, fxn:Callable[..., ReturnType]|None, captured:CapturedJit|None=None, prune=False):
     assert fxn or captured, "need either a function or a CapturedJit"
     self.fxn = fxn
     self.captured: CapturedJit|None = captured
     self.cnt: int = 2 if self.fxn is None else 0
     self.prune = prune
-    self.optimize = optimize
 
-  def add_buffer(self, b:Buffer) -> Buffer:
-    if found:=self._buffer_replace.get(b, None): return found
-    if b.is_allocated() or b.uop_refcount > 0: return b
-    if b._base is not None:
-      self._buffer_replace[b] = ret = Buffer(b.device, b.size, b.dtype, base=self.add_buffer(b._base), offset=b.offset)
-    else:
-      self._buffer_replace[b] = ret = Buffer(b.device, b.size, b.dtype, options=b.options)
-    return ret
-
-  def add(self, ei:ExecItem):
-    self._jit_cache.append(ExecItem(ei.ast, [self.add_buffer(buf) for buf in ei.bufs if buf is not None], ei.metadata, ei.fixedvars, ei.prg))
+  def add_linear(self, linear:UOp, var_vals:dict[str, int]): self._linears.append(linear)
 
   def reset(self):
     assert self.fxn is not None, "can't reset without function"
@@ -306,7 +493,41 @@ class TinyJit(Generic[ReturnType]):
 
   def __get__(self, obj, objtype): return functools.partial(self.__call__, obj) # add support for instance methods
 
+  def _fast_prepare_inputs(self, args, kwargs):
+    """Fast path for JIT exec: extract buffers directly, skip UOp operations."""
+    assert self.captured is not None
+    # extract tensors in same order as _prepare_jit_inputs
+    input_tensors = [(name,t) for name,t in list(enumerate(args))+sorted(kwargs.items()) if t.__class__ is Tensor]
+    names = [name for name,_ in input_tensors]
+    tensors = [t for _,t in input_tensors]
+    for x in args + tuple(kwargs.values()):
+      it = x if isinstance(x, (tuple,list)) else x.values() if isinstance(x, dict) else []
+      tensors += [t for t in it if t.__class__ is Tensor and not any(t is y for y in tensors)]
+    # extract buffers directly (skip UOp substitute/unbind which is expensive)
+    input_buffers = []
+    for t in tensors:
+      if t.uop.op is Ops.MULTI:
+        for u in t.uop.src:
+          if u.base.realized is not None:
+            b = u.base.realized
+            if isinstance(b, MultiBuffer): input_buffers.extend(b.bufs)
+            else: input_buffers.append(b)
+      else:
+        if t.uop.base.realized is not None:
+          b = t.uop.base.realized
+          if isinstance(b, MultiBuffer): input_buffers.extend(b.bufs)
+          else: input_buffers.append(b)
+    # return cached expected_input_info (it doesn't change between calls)
+    return input_buffers, {}, names, self.captured.expected_input_info
+
   def __call__(self, *args, **kwargs) -> ReturnType:
+    if self.cnt >= 2 and self.captured is not None:
+      if not hasattr(self, '_cached_inputs'):
+        input_buffers, var_vals, _, _ = self._fast_prepare_inputs(args, kwargs)
+        self._cached_inputs = (input_buffers, var_vals)
+      ret = self.captured(list(self._cached_inputs[0]), self._cached_inputs[1])
+      self.cnt += 1
+      return ret
     input_buffers, var_vals, names, expected_input_info = _prepare_jit_inputs(args, kwargs)
     if not JIT or self.cnt == 0:
       # jit ignore
@@ -318,20 +539,30 @@ class TinyJit(Generic[ReturnType]):
       # jit capture
       assert self.fxn is not None
       if capturing: raise RuntimeError(f"having TinyJit inside another TinyJit is not supported {len(capturing)=} {capturing=}")
-      self._jit_cache: list[ExecItem] = []
-      self._buffer_replace: WeakKeyDictionary[Buffer, Buffer] = WeakKeyDictionary()
-      # TODO: should we always disable the memory planner here? it must be off for prune
-      with Context(BEAM=getenv("JITBEAM", BEAM.value), NO_MEMORY_PLANNER=int(self.prune)):
-        capturing.append(self)
-        try:
-          ret = self.fxn(*args, **kwargs)
-          if len(params:=get_parameters(ret)): Tensor.realize(*params)
-        finally: capturing.clear()
-      jit_cache = self._jit_cache
-      del self._buffer_replace, self._jit_cache
-      if not len(jit_cache): raise JitError("didn't JIT anything!")
+      self._linears: list[UOp] = []
+      capturing.append(self)
+      try:
+        ret = self.fxn(*args, **kwargs)
+        if len(params:=get_parameters(ret)): Tensor.realize(*params)
+      finally: capturing.clear()
+      if not len(self._linears): raise JitError("didn't JIT anything!")
       _check_no_non_tensor_return(ret)
-      if DEBUG >= 1: print(f"JIT captured {len(jit_cache)} kernels with {len(input_buffers)} inputs")
+      if DEBUG >= 1: print(f"JIT captured {len(self._linears)} linears with {len(input_buffers)} inputs")
+
+      # combine all captured linears into one, memory plan, and convert to ExecItems
+      big_linear = UOp(Ops.LINEAR, src=tuple(flatten([l.src for l in self._linears])))
+      del self._linears
+
+      if self.prune:
+        big_linear, onetime_linear = prune_linear(big_linear, {k for k,v in buffers.items() if isinstance(v, Buffer) and v in set(input_buffers)})
+        if DEBUG >= 1: print(f"pruned from {len(big_linear.src) + len(onetime_linear.src)} -> {len(big_linear.src)} kernels")
+        for ei in (si.lower() for si in linear_to_schedule(onetime_linear)):
+          for b in ei.bufs: cast(Buffer, b).ensure_allocated()
+          ei.run(var_vals, jit=True)
+
+      held_bufs = set(buffers) | {t.uop.buf_uop for t in get_parameters(ret) if t.uop.buf_uop.op is Ops.BUFFER}
+      with Context(BEAM=getenv("JITBEAM", BEAM.value)):
+        jit_cache = jit_lower(big_linear, held_bufs)
 
       # track inputs that are views of buffers
       # TODO: eventually expected_buffers should live in ExecItem
@@ -342,30 +573,13 @@ class TinyJit(Generic[ReturnType]):
             input_buffers.append(b)
             extra_view_inputs.append((input_buffers.index(b.base), b.offset, b.device, b.size, b.dtype))
 
-      # prune independent kernels (optional)
-      if self.prune:
-        depends = set(input_buffers)
-        update_depends(depends, jit_cache)
-        pruned, onetime = partition(jit_cache, lambda ei: any(b in depends for b in get_out_buffers_for_ei(ei)))
-        if DEBUG >= 1: print(f"pruned from {len(jit_cache)} -> {len(pruned)} kernels")
-        # run the onetime kernels here
-        for ei in onetime:
-          for b in ei.bufs: cast(Buffer, b).ensure_allocated()
-          ei.run(var_vals, jit=True)
-        jit_cache = pruned
-
-      # memory planning (optional)
-      # Exclude buffers involved in transfer ops to preserve parallelism.
-      noopt_buffers = {b for ji in jit_cache if isinstance(ji.prg, (BufferXfer, BufferCopy, EncDec)) for b in ji.bufs}
-      assigned = _internal_memory_planner([cast(list[Buffer], item.bufs) for item in jit_cache], noopt_buffers, debug_prefix="JIT ")
-      jit_cache = [replace(item, bufs=[assigned.get(b,b).ensure_allocated() for b in item.bufs if b is not None]) for item in jit_cache]
-
       input_replace = get_input_replace(jit_cache, input_buffers)
       if DEBUG >= 1 and len(set(input_replace.values())) != len(input_buffers): print("WARNING: some input tensors not found")
 
-      # set this for next run
+      # exec
+      for ei in jit_cache: ei.run(var_vals)
+
       self.captured = CapturedJit(ret, jit_cache, input_replace, extra_view_inputs, names, expected_input_info)
-      if self.optimize: self.captured.replan_buffers_memory_layout()
     elif self.cnt >= 2:
       # jit exec
       assert self.captured is not None

@@ -265,8 +265,6 @@ class TestCustomKernel(unittest.TestCase):
     Expected schedule order: [A2, B2, E, custom_addmul, final_sum]
     The custom_addmul kernel should be at index 3.
     """
-    from tinygrad.engine.schedule import create_schedule
-    from tinygrad.schedule.rangeify import get_rangeify_map
 
     A, B = Tensor.empty(4, 4), Tensor.empty(4, 4)
     A2 = (A + 1).contiguous()                      # kernel 0: depends on A
@@ -275,11 +273,7 @@ class TestCustomKernel(unittest.TestCase):
     C, D, _, _ = Tensor.custom_kernel(C, D, A2, B2, fxn=custom_elementwise_addmul_kernel)  # depends on A2 AND B2
     E = (A2 * 3).contiguous()                      # kernel 2: depends only on A2
     result = (C + D + E).sum()                     # kernel 3: custom_addmul, then kernel 4: sum
-
-    big_sink = result.uop.sink()
-    tensor_map = get_rangeify_map(big_sink)
-    sched_sink = big_sink.substitute(tensor_map)
-    schedule, _ = create_schedule(sched_sink)
+    schedule = result.schedule()
 
     # Find the custom_addmul kernel position
     custom_idx = next((i for i, item in enumerate(schedule)
@@ -288,6 +282,31 @@ class TestCustomKernel(unittest.TestCase):
 
     self.assertIsNotNone(custom_idx, "custom_addmul kernel not found in schedule")
     self.assertEqual(custom_idx, 3, f"custom_addmul should be at index 3, got {custom_idx}")
+
+  def test_anonymous_buffers_in_function(self):
+    """Test that custom kernels with anonymous output buffers work inside @function."""
+    a = Tensor.full((4, 4), 3.).contiguous()
+    b = Tensor.full((4, 4), 2.).contiguous()
+    Tensor.realize(a, b)
+
+    def custom_add_with_tmp(o1:UOp, o2:UOp, A:UOp, B:UOp) -> UOp:
+      o1,o2,A,B = o1.flatten(), o2.flatten(), A.flatten(), B.flatten()
+      i = UOp.range(o1.size, 0)
+      store_o1 = o1[i].store(A[i]+B[i])
+      store_o2 = o2[i].store(A[i]+B[i]+2)
+      return UOp.group(store_o1, store_o2).end(i).sink(arg=KernelInfo(name=f"add_with_tmp_{o1.size}")).simplify()
+
+    from tinygrad import function
+    @function(precompile=True)
+    def run(x:Tensor, w:Tensor) -> Tensor:
+      out = Tensor.invalid(*x.shape, dtype=x.dtype)
+      tmp = Tensor.invalid(*x.shape, dtype=x.dtype)
+      out, tmp = Tensor.custom_kernel(out, tmp, x, w, fxn=custom_add_with_tmp)[:2]
+      return out+tmp
+
+    result = run(a, b).flatten().tolist()
+    expected = (3+2)*2+2
+    assert all(x == expected for x in result), f"expected all {expected}, got {result}"
 
 if __name__ == '__main__':
   unittest.main()

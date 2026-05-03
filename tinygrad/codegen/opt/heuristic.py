@@ -41,7 +41,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
           if szs:
             # set it to the replaced range
             rngs[tc_dim] = tk.apply_opt(Opt(OptOps.UPCAST, tk.rngs.index(rngs[tc_dim]), szs[0]))[0]
-        if (szs := [sz for sz in [4,2] if rngs[0].src[0].divides(sz) is not None]): # attempt to local N
+        if not NOLOCALS and (szs := [sz for sz in [4,2] if rngs[0].src[0].divides(sz) is not None]): # attempt to local N
           tk.apply_opt(Opt(OptOps.LOCAL, tk.rngs.index(rngs[0]), szs[0]))
       return tk
 
@@ -62,7 +62,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # should use matvec - TODO: adjust/tune based on the wide vs tall/large vs small mat
   MV_BLOCKSIZE, MV_THREADS_PER_ROW, MV_ROWS_PER_THREAD = getenv("MV_BLOCKSIZE", 4), getenv("MV_THREADS_PER_ROW", 8), getenv("MV_ROWS_PER_THREAD", 4)
-  if k.ren.has_local and getenv("MV",1) != 0 and (MV_BLOCKSIZE > 1 or MV_THREADS_PER_ROW > 1 or MV_ROWS_PER_THREAD > 1) and  \
+  if k.ren.has_local and not NOLOCALS and getenv("MV",1) != 0 and (MV_BLOCKSIZE > 1 or MV_THREADS_PER_ROW > 1 or MV_ROWS_PER_THREAD > 1) and  \
     k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and len(k.full_shape) >= 2 and k.ren.has_shared and \
     (mulop:=k.reduceop.src[0]).op is Ops.MUL and mulop.src[0].op is Ops.INDEX and mulop.src[1].op is Ops.INDEX:
     idx0, idx1 = mulop.src[0].src[1].get_idx(), mulop.src[1].src[1].get_idx()
@@ -80,8 +80,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             if MV_ROWS_PER_THREAD > 1: k.apply_opt(Opt(OptOps.UPCAST, global_idx, MV_ROWS_PER_THREAD))
             return k
 
-  # are we grouping? (requires local shape support)
-  if resolve(prod(k.output_shape[i] for i in k.upcastable_dims) <= (240 if NOLOCALS else 2048), False):
+  # are we grouping? (requires local shape support, skip when NOLOCALS)
+  if not NOLOCALS and resolve(prod(k.output_shape[i] for i in k.upcastable_dims) <= 2048, False):
     for axis, sz in itertools.product((0, 1, 2), (16,)):
       try:
         k.apply_opt(Opt(OptOps.GROUPTOP, axis, sz))

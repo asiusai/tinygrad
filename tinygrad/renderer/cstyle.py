@@ -165,7 +165,7 @@ class CStyleLanguage(Renderer):
 
     child_count = Counter(v for ru in uops for v in ru.src)
     # find which PARAMs are stored to with a single toposort
-    writable_params = {u for u in UOp.sink(*[u.src[0] for u in uops if u.op is Ops.STORE]).toposort() if u.op is Ops.PARAM}
+    writable_params = {u for u in UOp.sink(*[u.src[0] for u in uops if u.op is Ops.STORE]).toposort(lambda u: u.op != Ops.END) if u.op is Ops.PARAM}
     bufs: dict[UOp, tuple[str, tuple[DType, bool]]] = {}
     kernel = []
     depth = 1
@@ -180,7 +180,9 @@ class CStyleLanguage(Renderer):
         if u.arg is not None: name = u.arg.function_name
         continue
       if u.op in (Ops.PARAM, Ops.DEFINE_VAR):
-        r[u] = (f"data{u.arg}_{sz}" if (sz:=u.ptrdtype.size) > 0 else f"data{u.arg}") if u.op is Ops.PARAM else u.arg[0]
+        if u.op is not Ops.PARAM: r[u] = u.arg[0]
+        elif isinstance(u.dtype, ImageDType): r[u] = f"data{u.arg}_{u.dtype.shape[0]}x{u.dtype.shape[1]}"
+        else: r[u] = f"data{u.arg}_{sz}" if (sz:=u.ptrdtype.size) > 0 else f"data{u.arg}"
         bufs[u] = (r[u], (u.dtype, u in writable_params))
         continue
 
@@ -315,7 +317,12 @@ class OpenCLRenderer(CStyleLanguage):
     if any(uop.dtype.base == dtypes.half for uop in uops): prefix = (["#pragma OPENCL EXTENSION cl_khr_fp16 : enable"] + (prefix or []))
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
-  def aux(self, uops:list[UOp]): return (tuple(u.dtype for u in uops if u.op == Ops.PARAM),)
+  def aux(self, uops:list[UOp]):
+    arg_dtypes:list[list[tuple[int, DType]]] = []
+    for i,u in enumerate(u for u in uops if u.op is Ops.PARAM):
+      while len(arg_dtypes) <= u.arg: arg_dtypes.append([])
+      arg_dtypes[u.arg].append((i, u.dtype))
+    return tuple(tuple(a) for a in arg_dtypes),
 
 class IntelRenderer(OpenCLRenderer):
   device, suffix, kernel_typedef = "CL", "INTEL", "__attribute__((intel_reqd_sub_group_size(8)))\n" + "__kernel void"
@@ -461,6 +468,7 @@ class AMDHIPRenderer(CStyleLanguage):
   shared_max = 65536
   # NOTE: this is only really needed on gfx12, even though gfx11 reports the same limitation
   global_max = (2147483647, 65535, 65535)
+  global_prod_max = (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
 
   @staticmethod
   def get_tensor_cores(arch):
@@ -479,8 +487,8 @@ class AMDHIPRenderer(CStyleLanguage):
         (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{x.arg[0]}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]},"
           f" {fp8_index(x.src[0].dtype)}, {fp8_index(x.src[0].dtype)}, 0, 0, 0, 0)" if x.arg[1][2] == 128 else None),
         (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{x.arg[0]}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]}, 0, 0, 0)"),
-        (UPat(Ops.CAST, dtypes.fp8s, (UPat.var("y", dtypes.float),), name="x",),
-          lambda ctx,x,y: f"f32_to_fp8({ctx[x.src[0]]}, {fp8_index(x.dtype)})"),
+        (UPat(Ops.CAST, dtypes.fp8s, (UPat(dtype=dtypes.float),), name="x",),
+          lambda ctx,x: f"f32_to_fp8({ctx[x.src[0]]}, {fp8_index(x.dtype)})"),
         (UPat(Ops.CAST, dtypes.float, (UPat.var("y", dtypes.fp8s),), name="x",),
           lambda ctx,x,y: f"__builtin_amdgcn_cvt_f32_{('fp8', 'bf8')[fp8_index(y.dtype)]}((unsigned int){ctx[x.src[0]]}, 0)"),
       ]) + base_rewrite
@@ -559,4 +567,11 @@ class AMDHIPCCRenderer(AMDHIPRenderer):
     super().__init__(arch)
     self.compiler = HIPCCCompiler(arch)
 
-class QCOMRenderer(OpenCLRenderer): device = "QCOM"
+class QCOMCLRenderer(OpenCLRenderer):
+  device = "QCOM"
+
+  def __init__(self, chip_id):
+    from tinygrad.runtime.support.compiler_qcom import QCOMCompiler
+    self.chip_id, self.compiler = chip_id, QCOMCompiler(chip_id)
+
+  def __reduce__(self): return self.__class__, (self.chip_id,)
