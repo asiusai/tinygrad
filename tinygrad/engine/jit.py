@@ -429,22 +429,14 @@ class CapturedJit(Generic[ReturnType]):
         ctypes.POINTER(ctypes.c_void_p),
         ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
       clib._smart_setup = True
-    if needs_full_init:
-      err = clib.dispatch_smart(queue_ptr, n_k, c_kernels, c_ndims, c_gs, c_ls, c_has_local,
-                                c_buf_counts, c_buf_offsets, c_buf_indices, c_buf_values,
-                                None,
-                                c_val_counts, c_val_offsets, c_val_indices, c_val_values)
-      if err != 0: raise RuntimeError(f"dispatch_smart error: {err}")
-      n_b = sum(c_buf_counts[k] for k in range(n_k))
-      self._prev_buf_values = (ctypes.c_void_p * n_b)()
-      for i in range(n_b): self._prev_buf_values[i] = c_buf_values[i]
-      data[-1] = False
-    else:
-      err = clib.dispatch_smart(queue_ptr, n_k, c_kernels, c_ndims, c_gs, c_ls, c_has_local,
-                                c_buf_counts, c_buf_offsets, c_buf_indices, c_buf_values,
-                                self._prev_buf_values,
-                                c_val_counts, c_val_offsets, c_val_indices, c_val_values)
-      if err != 0: raise RuntimeError(f"dispatch_smart error: {err}")
+    err = clib.dispatch_smart(queue_ptr, n_k, c_kernels, c_ndims, c_gs, c_ls, c_has_local,
+                              c_buf_counts, c_buf_offsets, c_buf_indices, c_buf_values,
+                              None,
+                              c_val_counts, c_val_offsets, c_val_indices, c_val_values)
+    if err != 0: raise RuntimeError(f"dispatch_smart error: {err}")
+    if Device.DEFAULT == "CL":
+      from tinygrad.runtime.autogen import opencl as cl
+      cl.clFlush(Device["CL"].queue)
 
 
 def _prepare_jit_inputs(args, kwargs):
@@ -521,13 +513,6 @@ class TinyJit(Generic[ReturnType]):
     return input_buffers, {}, names, self.captured.expected_input_info
 
   def __call__(self, *args, **kwargs) -> ReturnType:
-    if self.cnt >= 2 and self.captured is not None:
-      if not hasattr(self, '_cached_inputs'):
-        input_buffers, var_vals, _, _ = self._fast_prepare_inputs(args, kwargs)
-        self._cached_inputs = (input_buffers, var_vals)
-      ret = self.captured(list(self._cached_inputs[0]), self._cached_inputs[1])
-      self.cnt += 1
-      return ret
     input_buffers, var_vals, names, expected_input_info = _prepare_jit_inputs(args, kwargs)
     if not JIT or self.cnt == 0:
       # jit ignore
