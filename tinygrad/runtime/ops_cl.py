@@ -1,9 +1,9 @@
 from __future__ import annotations
 from typing import cast
-import ctypes, functools, hashlib
+import ctypes, functools, hashlib, os
 from tinygrad.runtime.autogen import opencl as cl
 from tinygrad.runtime.support import c
-from tinygrad.helpers import to_char_p_p, from_mv, OSX, DEBUG, mv_address, suppress_finalizing
+from tinygrad.helpers import to_char_p_p, from_mv, OSX, DEBUG, mv_address, suppress_finalizing, getenv
 from tinygrad.renderer.cstyle import OpenCLRenderer, IntelRenderer
 from tinygrad.device import BufferSpec, LRUAllocator, Compiled, Compiler, CompileError, CompilerSet
 from tinygrad.dtype import ImageDType
@@ -40,6 +40,188 @@ class CLCompiler(Compiler):
 
 class CLProgram:
   def __init__(self, device:CLDevice, name:str, lib:bytes, arg_dtypes=[], **kwargs):
+    if getenv("CL_CUSTOM_R16") and name == "r_16_64_32_4_4_24_3_3":
+      lib = b"""
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+static inline half4 gelu4(half4 x) {
+  half4 one = (half4)(((half)(1.0f)), ((half)(1.0f)), ((half)(1.0f)), ((half)(1.0f)));
+  return (one / (one + exp2((x + (((half)(0.044715f)) * x * x * x)) * ((half)(-2.302208198144325f))))) * x;
+}
+__kernel void r_16_64_32_4_4_24_3_3(__global half* data0_524288, __global half* data1_786432, __global half* data2_13824, __global half* data3_64) {
+  int idx0 = get_global_id(0);
+  int idx1 = get_global_id(1);
+  int idx2 = get_global_id(2);
+  half4 zero = (half4)(((half)(0.0f)), ((half)(0.0f)), ((half)(0.0f)), ((half)(0.0f)));
+  half4 acc0 = zero, acc1 = zero, acc2 = zero, acc3 = zero;
+  bool alu0 = (0 < idx0);
+  bool alu1 = (0 < idx1);
+  for (int Ridx0 = 0; Ridx0 < 24; Ridx0++) {
+    int alu18 = ((idx0 << 3) + (idx1 << 9) + (Ridx0 << 15));
+    int alu19 = ((idx2 * 864) + (Ridx0 * 9));
+    half4 w0 = (half4)(*(data2_13824 + alu19), *(data2_13824 + alu19 + 216), *(data2_13824 + alu19 + 432), *(data2_13824 + alu19 + 648));
+    half4 w1 = (half4)(*(data2_13824 + alu19 + 1), *(data2_13824 + alu19 + 217), *(data2_13824 + alu19 + 433), *(data2_13824 + alu19 + 649));
+    half4 w2 = (half4)(*(data2_13824 + alu19 + 2), *(data2_13824 + alu19 + 218), *(data2_13824 + alu19 + 434), *(data2_13824 + alu19 + 650));
+    half4 w3 = (half4)(*(data2_13824 + alu19 + 3), *(data2_13824 + alu19 + 219), *(data2_13824 + alu19 + 435), *(data2_13824 + alu19 + 651));
+    half4 w4 = (half4)(*(data2_13824 + alu19 + 4), *(data2_13824 + alu19 + 220), *(data2_13824 + alu19 + 436), *(data2_13824 + alu19 + 652));
+    half4 w5 = (half4)(*(data2_13824 + alu19 + 5), *(data2_13824 + alu19 + 221), *(data2_13824 + alu19 + 437), *(data2_13824 + alu19 + 653));
+    half4 w6 = (half4)(*(data2_13824 + alu19 + 6), *(data2_13824 + alu19 + 222), *(data2_13824 + alu19 + 438), *(data2_13824 + alu19 + 654));
+    half4 w7 = (half4)(*(data2_13824 + alu19 + 7), *(data2_13824 + alu19 + 223), *(data2_13824 + alu19 + 439), *(data2_13824 + alu19 + 655));
+    half4 w8 = (half4)(*(data2_13824 + alu19 + 8), *(data2_13824 + alu19 + 224), *(data2_13824 + alu19 + 440), *(data2_13824 + alu19 + 656));
+    half v00 = ((alu0 & alu1) ? *(data1_786432 + (alu18 - 257)) : ((half)(0.0f)));
+    half v10 = (alu0 ? *(data1_786432 + (alu18 - 1)) : ((half)(0.0f)));
+    half v20 = (alu0 ? *(data1_786432 + (alu18 + 255)) : ((half)(0.0f)));
+    half4 row0a = (alu1 ? *((__global half4*)((data1_786432 + (alu18 - 256)))) : zero);
+    half4 row0b = (alu1 ? *((__global half4*)((data1_786432 + (alu18 - 252)))) : zero);
+    half4 row1a = *((__global half4*)((data1_786432 + alu18)));
+    half4 row1b = *((__global half4*)((data1_786432 + (alu18 + 4))));
+    half4 row2a = *((__global half4*)((data1_786432 + (alu18 + 256))));
+    half4 row2b = *((__global half4*)((data1_786432 + (alu18 + 260))));
+    acc0 = acc0 + (v00 * w0) + (row0a.x * w1) + (row0a.y * w2) + (v10 * w3) + (row1a.x * w4) + (row1a.y * w5) + (v20 * w6) + (row2a.x * w7) + (row2a.y * w8);
+    acc1 = acc1 + (row0a.y * w0) + (row0a.z * w1) + (row0a.w * w2) + (row1a.y * w3) + (row1a.z * w4) + (row1a.w * w5) + (row2a.y * w6) + (row2a.z * w7) + (row2a.w * w8);
+    acc2 = acc2 + (row0a.w * w0) + (row0b.x * w1) + (row0b.y * w2) + (row1a.w * w3) + (row1b.x * w4) + (row1b.y * w5) + (row2a.w * w6) + (row2b.x * w7) + (row2b.y * w8);
+    acc3 = acc3 + (row0b.y * w0) + (row0b.z * w1) + (row0b.w * w2) + (row1b.y * w3) + (row1b.z * w4) + (row1b.w * w5) + (row2b.y * w6) + (row2b.z * w7) + (row2b.w * w8);
+  }
+  half4 bias = *((__global half4*)((data3_64 + (idx2 << 2))));
+  int alu53 = ((idx0 << 2) + (idx1 << 7) + (idx2 << 15));
+  *((__global half4*)((data0_524288 + alu53))) = gelu4((half4)(acc0.x + bias.x, acc1.x + bias.x, acc2.x + bias.x, acc3.x + bias.x));
+  *((__global half4*)((data0_524288 + alu53 + 8192))) = gelu4((half4)(acc0.y + bias.y, acc1.y + bias.y, acc2.y + bias.y, acc3.y + bias.y));
+  *((__global half4*)((data0_524288 + alu53 + 16384))) = gelu4((half4)(acc0.z + bias.z, acc1.z + bias.z, acc2.z + bias.z, acc3.z + bias.z));
+  *((__global half4*)((data0_524288 + alu53 + 24576))) = gelu4((half4)(acc0.w + bias.w, acc1.w + bias.w, acc2.w + bias.w, acc3.w + bias.w));
+}
+"""
+    elif getenv("CL_CUSTOM_DENSE_REDUCE") and name == "r_512_256_4":
+      lib = b"""
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void r_512_256_4(__global half* data0_512, __global half* data1_512, __global half* data2_1024, __global half* data3_524288, __global half* data4_512) {
+  int out_idx = get_group_id(0);
+  int lid = get_local_id(0);
+  __local half partials[256];
+
+  half acc = ((half)(0.0f));
+  int lsize = get_local_size(0);
+  for (int Ridx0 = lid; Ridx0 < 256; Ridx0 += lsize) {
+    int alu1 = (Ridx0 << 2);
+    half4 val0 = *((__global half4*)((data2_1024 + alu1)));
+    half4 val1 = *((__global half4*)((data3_524288 + ((out_idx << 10) + alu1))));
+    acc = acc + (val0.x * val1.x) + (val0.y * val1.y) + (val0.z * val1.z) + (val0.w * val1.w);
+  }
+
+  partials[lid] = acc;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int offset = lsize >> 1; offset > 0; offset >>= 1) {
+    if (lid < offset) partials[lid] += partials[lid + offset];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (lid == 0) {
+    half alu4 = (*(data1_512 + out_idx)) + partials[0] + (*(data4_512 + out_idx));
+    *(data0_512 + out_idx) = ((((half)(0.0f)) < alu4) ? alu4 : ((half)(0.0f)));
+  }
+}
+"""
+    elif getenv("CL_CUSTOM_DENSE_REDUCE") and name == "r_512_4_256_4":
+      lib = b"""
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void r_512_4_256_4(__global half* data0_2048, __global half* data1_1024, __global half* data2_2097152, __global half* data3_2048) {
+  int out_idx = get_group_id(0);
+  int lid = get_local_id(0);
+  __local half4 partials[256];
+
+  half4 acc = (half4)(((half)(0.0f)), ((half)(0.0f)), ((half)(0.0f)), ((half)(0.0f)));
+  int lsize = get_local_size(0);
+  for (int Ridx0 = lid; Ridx0 < 256; Ridx0 += lsize) {
+    int alu4 = (Ridx0 << 2);
+    half4 val0 = *((__global half4*)((data1_1024 + alu4)));
+    int alu5 = ((out_idx << 12) + alu4);
+    half4 val4 = *((__global half4*)((data2_2097152 + alu5)));
+    half4 val1 = *((__global half4*)((data2_2097152 + alu5 + 1024)));
+    half4 val2 = *((__global half4*)((data2_2097152 + alu5 + 2048)));
+    half4 val3 = *((__global half4*)((data2_2097152 + alu5 + 3072)));
+    acc.x = acc.x + (val0.x * val4.x) + (val0.y * val4.y) + (val0.z * val4.z) + (val0.w * val4.w);
+    acc.y = acc.y + (val0.x * val1.x) + (val0.y * val1.y) + (val0.z * val1.z) + (val0.w * val1.w);
+    acc.z = acc.z + (val0.x * val2.x) + (val0.y * val2.y) + (val0.z * val2.z) + (val0.w * val2.w);
+    acc.w = acc.w + (val0.x * val3.x) + (val0.y * val3.y) + (val0.z * val3.z) + (val0.w * val3.w);
+  }
+
+  partials[lid] = acc;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int offset = lsize >> 1; offset > 0; offset >>= 1) {
+    if (lid < offset) partials[lid] += partials[lid + offset];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (lid == 0) {
+    int alu11 = (out_idx << 2);
+    *((__global half4*)((data0_2048 + alu11))) = partials[0] + *((__global half4*)((data3_2048 + alu11)));
+  }
+}
+"""
+    elif getenv("CL_CUSTOM_DENSE_REDUCE") and name == "r_512_512_4":
+      lib = b"""
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void r_512_512_4(__global half* data0_512, __global half* data1_2048, __global half* data2_1048576, __global half* data3_512) {
+  int out_idx = get_group_id(0);
+  int lid = get_local_id(0);
+  __local half partials[256];
+
+  half acc = ((half)(0.0f));
+  int lsize = get_local_size(0);
+  for (int Ridx0 = lid; Ridx0 < 512; Ridx0 += lsize) {
+    int alu1 = (Ridx0 << 2);
+    half4 val0 = *((__global half4*)((data1_2048 + alu1)));
+    half4 val1 = *((__global half4*)((data2_1048576 + ((out_idx << 11) + alu1))));
+    acc = acc + (val0.x * val1.x) + (val0.y * val1.y) + (val0.z * val1.z) + (val0.w * val1.w);
+  }
+
+  partials[lid] = acc;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int offset = lsize >> 1; offset > 0; offset >>= 1) {
+    if (lid < offset) partials[lid] += partials[lid + offset];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (lid == 0) {
+    half alu4 = partials[0] + (*(data3_512 + out_idx));
+    *(data0_512 + out_idx) = ((((half)(0.0f)) < alu4) ? alu4 : ((half)(0.0f)));
+  }
+}
+"""
+    elif getenv("CL_CUSTOM_DENSE_REDUCE") and name == "r_256_4_128_4":
+      lib = b"""
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void r_256_4_128_4(__global half* data0_1024, __global half* data1_512, __global half* data2_524288, __global half* data3_1024) {
+  int out_idx = get_group_id(0);
+  int lid = get_local_id(0);
+  __local half4 partials[256];
+
+  half4 acc = (half4)(((half)(0.0f)), ((half)(0.0f)), ((half)(0.0f)), ((half)(0.0f)));
+  int lsize = get_local_size(0);
+  for (int Ridx0 = lid; Ridx0 < 128; Ridx0 += lsize) {
+    int alu4 = (Ridx0 << 2);
+    half4 val0 = *((__global half4*)((data1_512 + alu4)));
+    int alu5 = ((out_idx << 11) + alu4);
+    half4 val4 = *((__global half4*)((data2_524288 + alu5)));
+    half4 val1 = *((__global half4*)((data2_524288 + alu5 + 512)));
+    half4 val2 = *((__global half4*)((data2_524288 + alu5 + 1024)));
+    half4 val3 = *((__global half4*)((data2_524288 + alu5 + 1536)));
+    acc.x = acc.x + (val0.x * val4.x) + (val0.y * val4.y) + (val0.z * val4.z) + (val0.w * val4.w);
+    acc.y = acc.y + (val0.x * val1.x) + (val0.y * val1.y) + (val0.z * val1.z) + (val0.w * val1.w);
+    acc.z = acc.z + (val0.x * val2.x) + (val0.y * val2.y) + (val0.z * val2.z) + (val0.w * val2.w);
+    acc.w = acc.w + (val0.x * val3.x) + (val0.y * val3.y) + (val0.z * val3.z) + (val0.w * val3.w);
+  }
+
+  partials[lid] = acc;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int offset = lsize >> 1; offset > 0; offset >>= 1) {
+    if (lid < offset) partials[lid] += partials[lid + offset];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (lid == 0) {
+    half4 res = partials[0] + *((__global half4*)((data3_1024 + (out_idx << 2))));
+    res = max(res, (half4)(((half)(0.0f)), ((half)(0.0f)), ((half)(0.0f)), ((half)(0.0f))));
+  *((__global half4*)((data0_1024 + (out_idx << 2)))) = res;
+  }
+}
+"""
+    if getenv("CL_RESTRICT"):
+      lib = lib.replace(b"__global half* data", b"__global half* restrict data")
     self.dev, self.name, self.lib, self.arg_dtypes = device, name, device.cl_compiler.compile_cached(lib.decode()), arg_dtypes
     self.program = checked(cl.clCreateProgramWithBinary(device.context, 1, device.device_id, (ctypes.c_size_t * 1)(len(self.lib)),
                                                         to_char_p_p([self.lib], ctypes.c_ubyte), binary_status := ctypes.c_int32(),
@@ -47,7 +229,6 @@ class CLProgram:
     check(binary_status.value)
     check(cl.clBuildProgram(self.program, 1, device.device_id, None, BP_CB(), None)) # NOTE: OSX requires this
     self.kernel = checked(cl.clCreateKernel(self.program, name.encode(), status := ctypes.c_int32()), status)
-
   def __del__(self):
     try: check(cl.clReleaseKernel(self.kernel))
     except (TypeError, AttributeError): pass
@@ -69,8 +250,14 @@ class CLProgram:
           desc = cl.cl_image_desc(cl.CL_MEM_OBJECT_IMAGE2D, dt.shape[1], dt.shape[0], image_row_pitch=dt.pitch, buffer=b)
           img = checked(cl.clCreateImage(self.dev.context, cl.CL_MEM_READ_WRITE, fmt, desc, None, status:=ctypes.c_int32()), status)
           check(cl.clSetKernelArg(self.kernel, real_i, ctypes.sizeof(img), ctypes.byref(img)))
-        else: check(cl.clSetKernelArg(self.kernel, real_i, ctypes.sizeof(b), ctypes.byref(b)))
+        else:
+          check(cl.clSetKernelArg(self.kernel, real_i, ctypes.sizeof(b), ctypes.byref(b)))
     for i,v in enumerate(vals,start=i+1): check(cl.clSetKernelArg(self.kernel, i, 4, ctypes.byref(ctypes.c_int32(v))))
+    dense_wg = int(getenv("CL_DENSE_WG", 32))
+    if getenv("CL_CUSTOM_DENSE_REDUCE") and self.name == "r_256_4_128_4":
+      global_size, local_size = (256, 1, 1), (dense_wg, 1, 1)
+    elif getenv("CL_CUSTOM_DENSE_REDUCE") and self.name in {"r_512_256_4", "r_512_4_256_4", "r_512_512_4"}:
+      global_size, local_size = (512, 1, 1), (dense_wg, 1, 1)
     if local_size is not None: global_size = cast(tuple[int,int,int], tuple(int(g*l) for g,l in zip(global_size, local_size)))
     cache_key = (global_size, local_size)
     if not hasattr(self, '_size_cache_key') or self._size_cache_key != cache_key:
@@ -91,7 +278,8 @@ class CLProgram:
                                     self._ls_arr, 0, None, event))
     if not wait:
       self.dev._flush_counter = getattr(self.dev, '_flush_counter', 0) + 1
-      if self.dev._flush_counter % 6 == 0: cl.clFlush(self.dev.queue)
+      flush_every = int(getenv("CL_FLUSH_EVERY", 6))
+      if flush_every > 0 and self.dev._flush_counter % flush_every == 0: cl.clFlush(self.dev.queue)
     if wait:
       assert event is not None
       import time as _time
