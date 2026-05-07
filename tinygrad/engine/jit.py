@@ -1,7 +1,7 @@
 from typing import TypeVar, Generic, Callable, cast, Any
 import functools, collections
 from tinygrad.tensor import Tensor
-from tinygrad.helpers import flatten, merge_dicts, DEBUG, Context, BEAM, getenv, colored, JIT, JIT_BATCH_SIZE, dedup, unwrap, pluralize, PROFILE
+from tinygrad.helpers import flatten, merge_dicts, DEBUG, Context, BEAM, getenv, colored, JIT, JIT_BATCH_SIZE, dedup, unwrap, pluralize, PROFILE, all_int
 from tinygrad.device import Buffer, Compiled, Device, MultiBuffer
 from tinygrad.dtype import DType
 from tinygrad.uop.ops import UOp, Variable, sym_infer, Ops, buffers, track_rewrites
@@ -309,6 +309,11 @@ class CapturedJit(Generic[ReturnType]):
     kernel_ei_refs = []
     buf_offset, val_offset = 0, 0
     buf_offsets_list, val_offsets_list = [], []
+    for ei in self._jit_cache:
+      if isinstance(ei.prg, CompiledRunner) and ei.prg.p.local_size is None and Device[ei.prg.p.device].renderer.has_local and all_int(ei.prg.p.global_size):
+        try: ei.run(var_vals, wait=True, jit=True, do_update_stats=False)
+        except Exception as e:
+          if DEBUG >= 2: print(f"fast dispatch local-size warmup failed for {ei.prg.display_name}: {type(e).__name__}: {e}")
     for j, ei in enumerate(self._jit_cache):
       if not isinstance(ei.prg, CompiledRunner):
         non_kernel_items.append((j, ei))
