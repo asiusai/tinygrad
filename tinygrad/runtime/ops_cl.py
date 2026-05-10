@@ -107,7 +107,11 @@ class CLProgram:
 
 class CLAllocator(LRUAllocator['CLDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> cl.cl_mem:
-    return checked(cl.clCreateBuffer(self.dev.context, cl.CL_MEM_READ_WRITE, size, None, status := ctypes.c_int32()), status)
+    flags, host_ptr = cl.CL_MEM_READ_WRITE, None
+    if options is not None and options.external_ptr is not None:
+      flags |= cl.CL_MEM_USE_HOST_PTR
+      host_ptr = ctypes.c_void_p(options.external_ptr)
+    return checked(cl.clCreateBuffer(self.dev.context, flags, size, host_ptr, status := ctypes.c_int32()), status)
   @suppress_finalizing
   def _free(self, opaque:cl.cl_mem, options:BufferSpec): check(cl.clReleaseMemObject(opaque))
   def _copyin(self, dest:cl.cl_mem, src:memoryview):

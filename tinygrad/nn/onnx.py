@@ -249,7 +249,10 @@ class OnnxPBParser:
       return obj
     assert isinstance(data, Tensor) and data.dtype == dtypes.uint8, data
     data = data.bitcast(true_dtype).reshape(shape)
-    data = data.to(Device.DEFAULT) if true_dtype is to_dtype else data.to("cpu").cast(to_dtype).to(Device.DEFAULT)
+    if true_dtype in (dtypes.int64, dtypes.uint64):
+      data = data.to("cpu") if true_dtype is to_dtype else data.to("cpu").cast(to_dtype)
+    else:
+      data = data.to(Device.DEFAULT) if true_dtype is to_dtype else data.to("cpu").cast(to_dtype).to(Device.DEFAULT)
     # const folding
     if shape == ():
       if data.dtype == dtypes.float16 and sys.version_info < (3, 12): data = data.cast(dtypes.float32)

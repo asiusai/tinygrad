@@ -286,6 +286,7 @@ class CapturedJit(Generic[ReturnType]):
     """Build data for two-phase C dispatch: first frame sets all args, subsequent frames set only changed args."""
     import ctypes, os
     from tinygrad.dtype import ImageDType
+    from tinygrad.runtime.autogen import opencl as cl
     lib_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'cl_dispatch.so')
     if not os.path.exists(lib_path): lib_path = '/data/openpilot/tinygrad_repo/cl_dispatch.so'
     try: clib = ctypes.CDLL(lib_path)
@@ -309,6 +310,19 @@ class CapturedJit(Generic[ReturnType]):
     kernel_ei_refs = []
     buf_offset, val_offset = 0, 0
     buf_offsets_list, val_offsets_list = [], []
+    image_args: dict[int, tuple[ImageDType, Any]] = {}
+    image_cache: dict[tuple[int, tuple[int, ...], int], Any] = {}
+
+    def get_image_arg(buf, dtype:ImageDType, dev):
+      key = (ctypes.cast(buf._buf, ctypes.c_void_p).value, dtype.shape, dtype.itemsize)
+      if (img := image_cache.get(key)) is None:
+        fmt = cl.cl_image_format(cl.CL_RGBA, {2:cl.CL_HALF_FLOAT, 4:cl.CL_FLOAT}[dtype.itemsize])
+        desc = cl.cl_image_desc(cl.CL_MEM_OBJECT_IMAGE2D, dtype.shape[1], dtype.shape[0], image_row_pitch=dtype.pitch, buffer=buf._buf)
+        img = cl.clCreateImage(dev.context, cl.CL_MEM_READ_WRITE, fmt, desc, None, status:=ctypes.c_int32())
+        if status.value != 0: raise RuntimeError(f"OpenCL image arg creation failed: {status.value}")
+        image_cache[key] = img
+      return img
+
     for ei in self._jit_cache:
       if isinstance(ei.prg, CompiledRunner) and ei.prg.p.local_size is None and Device[ei.prg.p.device].renderer.has_local and all_int(ei.prg.p.global_size):
         try: ei.run(var_vals, wait=True, jit=True, do_update_stats=False)
@@ -334,9 +348,9 @@ class CapturedJit(Generic[ReturnType]):
       bi, bm = [], []
       for k, ei_bufs_idx in enumerate(glob_idx):
         for real_i, dt in cl_prg.arg_dtypes[k]:
-          if not isinstance(dt, ImageDType):
-            bi.append(real_i)
-            bm.append(ei_bufs_idx)
+          bi.append(real_i)
+          bm.append(ei_bufs_idx)
+          if isinstance(dt, ImageDType): image_args[buf_offset + len(bi) - 1] = (dt, cl_prg.dev)
       buf_offsets_list.append(buf_offset)
       buf_counts_list.append(len(bi))
       buf_indices_flat.extend(bi)
@@ -369,7 +383,12 @@ class CapturedJit(Generic[ReturnType]):
       k_idx = 0
       while k_idx < n_k - 1 and buf_offsets_list[k_idx+1] <= bp: k_idx += 1
       b = kernel_ei_refs[k_idx].bufs[buf_ei_map_flat[bp]]
-      c_buf_values[bp] = ctypes.cast(b._buf, ctypes.c_void_p).value if b else 0
+      if b is None: c_buf_values[bp] = 0
+      elif bp in image_args:
+        dtype, dev = image_args[bp]
+        c_buf_values[bp] = ctypes.cast(get_image_arg(b, dtype, dev), ctypes.c_void_p).value
+      else:
+        c_buf_values[bp] = ctypes.cast(b._buf, ctypes.c_void_p).value
     changing = set(self._input_replace.keys())
     jit_to_kernel = {}
     ki = 0
@@ -377,7 +396,7 @@ class CapturedJit(Generic[ReturnType]):
       if isinstance(ei.prg, CompiledRunner):
         jit_to_kernel[j] = ki
         ki += 1
-    # build arrays for dispatch_fast: (kernel_index_in_c, cl_arg_index, ei_ref_k_idx, ei_bufs_idx)
+    # build arrays for dispatch_fast: (kernel_index_in_c, cl_arg_index, ei_ref_k_idx, ei_bufs_idx, flat buf arg index)
     changing_entries = []
     for bp in range(n_b):
       k_idx = 0
@@ -386,7 +405,7 @@ class CapturedJit(Generic[ReturnType]):
       for jj, kk in jit_to_kernel.items():
         if kk == k_idx:
           if (jj, ei_bufs_idx) in changing:
-            changing_entries.append((k_idx, buf_indices_flat[bp], k_idx, ei_bufs_idx))
+            changing_entries.append((k_idx, buf_indices_flat[bp], k_idx, ei_bufs_idx, bp))
           break
     n_ch = len(changing_entries)
     c_ch_kernel_indices = (ctypes.c_int * max(n_ch, 1))(*[e[0] for e in changing_entries])
@@ -398,12 +417,12 @@ class CapturedJit(Generic[ReturnType]):
     c_val_values = (ctypes.c_int * max(n_v, 1))(*val_values_flat)
     queue_ptr = ctypes.cast(queue, ctypes.c_void_p).value
     # store ei_ref info for changing entries
-    ch_ei_info = [(e[2], e[3]) for e in changing_entries]
+    ch_ei_info = [(e[2], e[3], e[4]) for e in changing_entries]
     return [clib, queue_ptr, n_k, c_kernels, c_ndims, c_gs, c_ls, c_has_local,
             c_buf_counts, c_buf_offsets, c_buf_indices, c_buf_values, kernel_ei_refs,
             c_val_counts, c_val_offsets, c_val_indices, c_val_values, non_kernel_items,
             n_ch, c_ch_kernel_indices, c_ch_arg_indices, c_ch_values, ch_ei_info,
-            True]  # last element: needs_full_init
+            image_args, image_cache, True]  # last element: needs_full_init
 
   def _run_fast_dispatch(self, var_vals: dict[str, int]):
     import ctypes
@@ -412,19 +431,30 @@ class CapturedJit(Generic[ReturnType]):
      c_buf_counts, c_buf_offsets, c_buf_indices, c_buf_values, kernel_ei_refs,
      c_val_counts, c_val_offsets, c_val_indices, c_val_values, non_kernel_items,
      n_ch, c_ch_kernel_indices, c_ch_arg_indices, c_ch_values, ch_ei_info,
-     needs_full_init) = data
+     image_args, image_cache, needs_full_init) = data
     for j, ei in non_kernel_items:
       ei.run(var_vals, jit=True)
     _cast = ctypes.cast
     _cvp = ctypes.c_void_p
-    for i, (k_idx, ei_bufs_idx) in enumerate(ch_ei_info):
+    def get_image_arg(buf, dtype, dev):
+      key = (_cast(buf._buf, _cvp).value, dtype.shape, dtype.itemsize)
+      if (img := image_cache.get(key)) is None:
+        from tinygrad.runtime.autogen import opencl as cl
+        fmt = cl.cl_image_format(cl.CL_RGBA, {2:cl.CL_HALF_FLOAT, 4:cl.CL_FLOAT}[dtype.itemsize])
+        desc = cl.cl_image_desc(cl.CL_MEM_OBJECT_IMAGE2D, dtype.shape[1], dtype.shape[0], image_row_pitch=dtype.pitch, buffer=buf._buf)
+        img = cl.clCreateImage(Device["CL"].context, cl.CL_MEM_READ_WRITE, fmt, desc, None, status:=ctypes.c_int32())
+        if status.value != 0: raise RuntimeError(f"OpenCL image arg creation failed: {status.value}")
+        image_cache[key] = img
+      return img
+
+    for i, (k_idx, ei_bufs_idx, bp) in enumerate(ch_ei_info):
       b = kernel_ei_refs[k_idx].bufs[ei_bufs_idx]
-      bo = c_buf_offsets[k_idx]
-      bc = c_buf_counts[k_idx]
-      for bp_off in range(bc):
-        if c_buf_indices[bo + bp_off] == c_ch_arg_indices[i]:
-          c_buf_values[bo + bp_off] = _cast(b._buf, _cvp).value if b else 0
-          break
+      if b is None: c_buf_values[bp] = 0
+      elif bp in image_args:
+        dtype, dev = image_args[bp]
+        c_buf_values[bp] = _cast(get_image_arg(b, dtype, dev), _cvp).value
+      else:
+        c_buf_values[bp] = _cast(b._buf, _cvp).value
     if not hasattr(clib, '_smart_setup'):
       clib.dispatch_smart.restype = ctypes.c_int
       clib.dispatch_smart.argtypes = [

@@ -11,6 +11,13 @@ from tinygrad.engine.jit import GraphRunner
 from tinygrad.engine.realize import CompiledRunner
 from tinygrad.helpers import mv_address, to_mv, round_up, data64_le, next_power2, flatten
 
+def _cpu_prep(fd: int, buf: MSMBuffer, op: int):
+  msm_drm.DRM_IOCTL_MSM_GEM_CPU_PREP(fd, handle=buf.handle, op=op,
+    timeout=msm_drm.struct_drm_msm_timespec(tv_sec=int(time.time()) + 10, tv_nsec=0))
+
+def _cpu_fini(fd: int, buf: MSMBuffer):
+  msm_drm.DRM_IOCTL_MSM_GEM_CPU_FINI(fd, handle=buf.handle)
+
 # PM4 packet helpers (shared with ops_qcom.py)
 def _parity(val: int):
   for i in range(4, 1, -1): val ^= val >> (1 << i)
@@ -53,14 +60,19 @@ class MSMAllocator(LRUAllocator['MSMDevice']):
     pass
 
   def _copyin(self, dest: MSMBuffer, src: memoryview):
+    _cpu_prep(self.dev.fd, dest, msm_drm.MSM_PREP_WRITE)
     ctypes.memmove(dest.cpu_addr, mv_address(src), src.nbytes)
+    _cpu_fini(self.dev.fd, dest)
 
   def _copyout(self, dest: memoryview, src: MSMBuffer):
     self.dev.synchronize()
+    _cpu_prep(self.dev.fd, src, msm_drm.MSM_PREP_READ)
     ctypes.memmove(mv_address(dest), src.cpu_addr, dest.nbytes)
+    _cpu_fini(self.dev.fd, src)
 
   def _as_buffer(self, src: MSMBuffer) -> memoryview:
     self.dev.synchronize()
+    _cpu_prep(self.dev.fd, src, msm_drm.MSM_PREP_READ)
     return to_mv(src.cpu_addr, src.size)
 
   def _offset(self, buf: MSMBuffer, size: int, offset: int) -> MSMBuffer:
@@ -153,6 +165,8 @@ def _build_pm4(prg: MSMProgram, args_buf: MSMBuffer, global_size, local_size) ->
   reg(mesa.REG_A6XX_SP_CS_CONST_CONFIG_0,
       qreg.a6xx_sp_cs_const_config_0(wgidconstid=prg.wgid, wgsizeconstid=prg.wgsz, wgoffsetconstid=0xfc, localidregid=prg.lid),
       qreg.a6xx_sp_cs_wge_cntl(linearlocalidregid=0xfc, threadsize=mesa.THREAD64))
+  reg(mesa.REG_A6XX_SP_CS_KERNEL_GROUP_X,
+      cast_int(global_size[0], ceil=True), cast_int(global_size[1], ceil=True), cast_int(global_size[2], ceil=True))
   cmd(mesa.CP_EXEC_CS, 0,
       qreg.cp_exec_cs_1(ngroups_x=global_size[0]), qreg.cp_exec_cs_2(ngroups_y=global_size[1]), qreg.cp_exec_cs_3(_ngroups_z=global_size[2]))
 
@@ -189,6 +203,7 @@ class MSMProgram:
     # allocate GEM BO for shader code
     self.lib_buf: MSMBuffer = dev.allocator.alloc(self.image_size)
     to_mv(self.lib_buf.cpu_addr, self.image_size)[:] = self.image
+    _cpu_fini(dev.fd, self.lib_buf)
 
     # compute derived sizes
     self.pvtmem_size_per_item: int = round_up(self.pvtmem, 512) >> 9
@@ -254,10 +269,12 @@ class MSMProgram:
 
     # build PM4 command stream
     pm4 = _build_pm4(self, args_buf, global_size, local_size)
+    _cpu_fini(self.dev.fd, args_buf)
 
     # write PM4 into command buffer
     cmd_buf: MSMBuffer = self.dev.allocator.alloc(len(pm4) * 4)
     to_mv(cmd_buf.cpu_addr, len(pm4) * 4).cast('I')[:] = array.array('I', pm4)
+    _cpu_fini(self.dev.fd, cmd_buf)
 
     # collect all referenced BOs for the submit
     bo_handles = {self.dev.dummy_buf.handle, self.dev._stack.handle, self.dev.border_color_buf.handle,
@@ -373,6 +390,7 @@ class MSMGraph(GraphRunner):
               self.input_to_patches.setdefault(input_idx, []).append((args_buf.cpu_addr + desc_off + 16, True))
 
       all_pm4.append(_build_pm4(prg, args_buf, gs, ls))
+      _cpu_fini(self.msm_dev.fd, args_buf)
       self.args_bufs.append(args_buf)
       self.bo_handles.add(args_buf.handle)
       self.bo_handles.add(prg.lib_buf.handle)
@@ -389,6 +407,7 @@ class MSMGraph(GraphRunner):
       to_mv(self.cmd_buf.cpu_addr + offset, len(pm4) * 4).cast('I')[:] = array.array('I', pm4)
       self.chunk_offsets.append((offset, len(pm4) * 4))
       offset += len(pm4) * 4
+    _cpu_fini(self.msm_dev.fd, self.cmd_buf)
 
   def _submit_range(self, start_kernel: int, end_kernel: int):
     """Submit a range of pre-built kernels as a single DRM_MSM_GEM_SUBMIT."""
@@ -427,6 +446,8 @@ class MSMGraph(GraphRunner):
           struct.pack_into("<II", to_mv(addr, 8), 0, buf.iova & 0xFFFFFFFF, buf.iova >> 32)
         else:
           struct.pack_into("<Q", to_mv(addr, 8), 0, buf.iova)
+    for args_buf in self.args_bufs:
+      _cpu_fini(self.msm_dev.fd, args_buf)
 
     # submit in chunks to let the display compositor interleave (no a6xx hardware preemption)
     st = time.perf_counter_ns() if wait else 0
@@ -498,8 +519,10 @@ class MSMDevice(Compiled):
     # allocate device-internal buffers
     self.dummy_buf: MSMBuffer = allocator.alloc(0x1000)
     ctypes.memset(self.dummy_buf.cpu_addr, 0, 0x1000)
+    _cpu_fini(self.fd, self.dummy_buf)
     self.border_color_buf: MSMBuffer = allocator.alloc(0x1000)
     ctypes.memset(self.border_color_buf.cpu_addr, 0, 0x1000)
+    _cpu_fini(self.fd, self.border_color_buf)
 
     # compilers: IR3 only (no QCOMCLRenderer, that needs KGSL)
     compilers = CompilerSet(cset=[(functools.partial(IR3Renderer, self.chip_id), None)])
