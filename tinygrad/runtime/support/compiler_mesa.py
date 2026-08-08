@@ -95,8 +95,12 @@ def disas_adreno(lib:bytes, gpu_id=630):
 
 class IR3Compiler(Compiler):
   def __init__(self, arch):
-    assert arch.split(',')[0] == "a630", "only a630 supported, for now"
-    self.arch, self.dev_id = arch, mesa.struct_fd_dev_id(630, 0x6030001)
+    gpu_arch, *options = arch.split(',')
+    assert gpu_arch in {"a630", "a635"}, f"unsupported Adreno architecture {gpu_arch}"
+    gpu_id = int(gpu_arch[1:])
+    option_values = dict(option.split('=', 1) for option in options if '=' in option)
+    chip_id = int(option_values.get("CHIP_ID", {630: "0x6030001", 635: "0x6030500"}[gpu_id]), 0)
+    self.arch, self.dev_id = arch, mesa.struct_fd_dev_id(int(option_values.get("GPU_ID", gpu_id)), chip_id)
     self.cc = mesa.ir3_compiler_create(None, self.dev_id, mesa.fd_dev_info(self.dev_id),
                                        mesa.struct_ir3_compiler_options(disable_cache=True)).contents
     self.cc.has_preamble = False
