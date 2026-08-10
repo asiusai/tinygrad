@@ -78,12 +78,16 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             return k
 
   # are we grouping? (requires local shape support)
-  if resolve(prod(k.output_shape[i] for i in k.upcastable_dims) <= (240 if NOLOCALS else 2048), False):
+  # Grouped reductions can wedge the a6xx WGE, while NOLOCALS serializes large reductions enough to exceed hangcheck.
+  if k.ren.target.device != "QCOM" and \
+     resolve(prod(k.output_shape[i] for i in k.upcastable_dims) <= (240 if NOLOCALS else getenv("REDUCE_GROUP_CAP", 2048)), False):
     for axis, sz in itertools.product((0, 1, 2), (16,)):
       try:
         k.apply_opt(Opt(OptOps.GROUPTOP, axis, sz))
         break
-      except KernelOptError: pass
+      except KernelOptError as e:
+        if DEBUG >= 4: print(f"GROUPTOP axis={axis} sz={sz} FAILED: {e}")
+        pass
 
   # no more opt if we are grouping
   if k.group_for_reduces: return k
@@ -100,10 +104,11 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     if k.full_shape[axis] <= 7 and is_masked and prod(k.full_shape[j] for j in to_upcast) * k.full_shape[axis] <= 7 * 7:
       # upcasting a masked global axis moves that range out of the launch grid into each work-item
       # under IMAGE, skip the upcast unless enough global work-items remain after it to hide memory latency
-      if IMAGE and k.axis_types[axis] is AxisType.GLOBAL:
+      if (IMAGE or k.ren.target.device == "QCOM") and k.axis_types[axis] is AxisType.GLOBAL:
         global_upcast = prod(k.full_shape[i] for i in to_upcast if k.axis_types[i] is AxisType.GLOBAL) * k.full_shape[axis]
         global_items_after = prod(k.full_shape[i] for i in k.axes_of(AxisType.GLOBAL)) // global_upcast
-        if resolve(global_items_after < getenv("OCCUPANCY_FLOOR", 4096), False): continue
+        occupancy_floor = getenv("QCOM_OCCUPANCY_FLOOR", 65536) if k.ren.target.device == "QCOM" else getenv("OCCUPANCY_FLOOR", 4096)
+        if resolve(global_items_after < occupancy_floor, False): continue
       if DEBUG >= 4: print(f"upcasting masked axis : {axis}")
       to_upcast.append(axis)
   for axis in to_upcast[::-1]: k.apply_opt(Opt(OptOps.UPCAST, axis, 0))
@@ -141,10 +146,14 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   try:
     if k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
       if (s:=k.full_shape[k.unrollable_dims[-1]]) <= 32:
-        k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
-        # if it's small, upcast a second reduce dimension too
-        if k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3:
+        # Fully unrolled reductions can produce shaders that lock up a6xx; bounded partial unrolling is safe.
+        if k.ren.target.device == "QCOM":
+          if s % 4 == 0: k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 4))
+        else:
           k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
+          # if it's small, upcast a second reduce dimension too
+          if k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3:
+            k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
       else:
         for splits in [4]:
           if k.full_shape[axis:=k.unrollable_dims[-1]]%splits == 0:
@@ -167,7 +176,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       local_axis_ranking = [(any(k.rngs[axis] not in b.src[1].get_idx().backward_slice for b in k.bufs), axis) \
                               for axis in k.axes_of(AxisType.GLOBAL, AxisType.WEAK) if k.rngs[axis].src[0].op is Ops.CONST]
       to_local: list[tuple[int, int]] = []
-      for _, axis in sorted(local_axis_ranking, key=lambda x: (-x[0], -x[1])):
+      qcom_mixed_expand = k.ren.target.device == "QCOM" and k.reduceop is not None and any(not x[0] for x in local_axis_ranking)
+      for _, axis in sorted(local_axis_ranking, key=lambda x: (-x[0], x[1] if qcom_mixed_expand else -x[1])):
         local_size = prod(sz for _, sz in to_local)
         local_sz: int|None = next((x for x in ([32] * (axis == 0) + [16,8,4,3,2]) if k.full_shape[axis] % x == 0 and local_size * x <= 128), None)
         if local_sz is not None: to_local.append((axis, local_sz))

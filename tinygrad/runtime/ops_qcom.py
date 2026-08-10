@@ -145,8 +145,8 @@ class QCOMComputeQueue(HWQueue):
     self.cmd(mesa.CP_SET_MARKER, qreg.a6xx_cp_set_marker_0(mode=mesa.RM6_COMPUTE))
     self.reg(mesa.REG_A6XX_SP_UPDATE_CNTL, qreg.a6xx_sp_update_cntl(vs_state=True, hs_state=True, ds_state=True, gs_state=True,
                                                                    fs_state=True, cs_state=True, cs_uav=True, gfx_uav=True))
-    self.reg(mesa.REG_A6XX_SP_CS_TSIZE, qreg.a6xx_sp_cs_tsize(0x80)) # is this right? mesa uses 1
-    self.reg(mesa.REG_A6XX_SP_CS_USIZE, qreg.a6xx_sp_cs_usize(0x40)) # mesa also uses 1
+    self.reg(mesa.REG_A6XX_SP_CS_TSIZE, qreg.a6xx_sp_cs_tsize(0x80))
+    self.reg(mesa.REG_A6XX_SP_CS_USIZE, qreg.a6xx_sp_cs_usize(0x40))
     self.reg(mesa.REG_A6XX_SP_MODE_CNTL, qreg.a6xx_sp_mode_cntl(isammode=mesa.ISAMMODE_GL if prg.NIR else mesa.ISAMMODE_CL,
                                                                 constant_demotion_enable=prg.NIR))
     self.reg(mesa.REG_A6XX_SP_PERFCTR_SHADER_MASK, qreg.a6xx_sp_perfctr_shader_mask(cs=True))
@@ -157,7 +157,7 @@ class QCOMComputeQueue(HWQueue):
     self.reg(mesa.REG_A6XX_SP_CS_NDRANGE_0,
              qreg.a6xx_sp_cs_ndrange_0(kerneldim=3, localsizex=local_size[0] - 1, localsizey=local_size[1] - 1, localsizez=local_size[2] - 1),
              global_size_mp[0], 0, global_size_mp[1], 0, global_size_mp[2], 0, 0xccc0cf,
-             0xfc | qreg.a6xx_sp_cs_wge_cntl(threadsize=wge_threadsize),
+             0xfc | qreg.a6xx_sp_cs_wge_cntl(threadsize=wge_threadsize, single_sp_core=self.dev.gpu_id == (6, 3, 5)),
              cast_int(global_size[0], ceil=True), cast_int(global_size[1], ceil=True), cast_int(global_size[2], ceil=True))
 
     self.reg(mesa.REG_A6XX_SP_CS_CNTL_0,
@@ -180,7 +180,8 @@ class QCOMComputeQueue(HWQueue):
                                                              state_block=mesa.SB6_CS_SHADER, num_unit=1024 // 4),
              *data64_le(args_state.buf.va_addr))
     self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_SHADER, state_src=mesa.SS6_INDIRECT,
-                                                             state_block=mesa.SB6_CS_SHADER, num_unit=ceildiv(prg.image_size, 128)),
+                                                             state_block=mesa.SB6_CS_SHADER,
+                                                             num_unit=min(ceildiv(prg.image_size, 128), self.dev.dev_info.a6xx.instr_cache_size)),
              *data64_le(prg.lib_gpu.va_addr))
 
     self.reg(mesa.REG_A6XX_SP_REG_PROG_ID_0, 0xfcfcfcfc, 0xfcfcfcfc, 0xfcfcfcfc, 0xfc,
@@ -216,7 +217,8 @@ class QCOMComputeQueue(HWQueue):
     if prg.NIR:
       self.reg(mesa.REG_A6XX_SP_CS_CONST_CONFIG_0,
                qreg.a6xx_sp_cs_const_config_0(wgidconstid=prg.wgid, wgsizeconstid=prg.wgsz, wgoffsetconstid=0xfc, localidregid=prg.lid),
-               qreg.a6xx_sp_cs_wge_cntl(linearlocalidregid=0xfc, threadsize=wge_threadsize))
+               qreg.a6xx_sp_cs_wge_cntl(linearlocalidregid=0xfc, threadsize=wge_threadsize,
+                                        single_sp_core=self.dev.gpu_id == (6, 3, 5)))
       if self.dev.dev_info.a6xx.has_lpac:
         self.reg(mesa.REG_A6XX_SP_CS_WIE_CNTL_0,
                  qreg.a6xx_sp_cs_wie_cntl_0(wgidconstid=prg.wgid, wgsizeconstid=prg.wgsz,
@@ -485,7 +487,7 @@ class MSMIface:
     self.gpu_id = (chip_id >> 24, (chip_id >> 16) & 0xff, (chip_id >> 8) & 0xff)
     if self.gpu_id not in {(6, 3, 0), (6, 3, 5)}:
       raise RuntimeError(f"MSM DRM requires a validated Adreno 630/635, got chip_id={self.chip_id:#x}")
-    self.submit_flags = msm_drm.MSM_PIPE_3D0 | (msm_drm.MSM_SUBMIT_SUDO if self.gpu_id == (6, 3, 5) else 0)
+    self.submit_flags = msm_drm.MSM_PIPE_3D0 | (msm_drm.MSM_SUBMIT_SUDO if self.gpu_id == (6, 3, 5) and getenv("QCOM_SUDO") else 0)  # kernel lacks CONFIG_DRM_MSM_GPU_SUDO
     va_start = msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_VA_START).value
     va_size = msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_VA_SIZE).value
     self.va_allocator = TLSFAllocator(va_size, base=va_start, block_size=mmap.PAGESIZE)

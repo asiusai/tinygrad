@@ -70,7 +70,11 @@ def fix_store_hazard(target:UOp, src:UOp):
 
 def split_reduceop(reduce:UOp, x:UOp):
   if prod(reduce.shape) == 0: return None
-  if not SPLIT_REDUCEOP or not all_int(x.shape) or (prod(x.shape)//prod(reduce.shape))<getenv("REDUCEOP_SPLIT_THRESHOLD", 32768): return None
+  if not SPLIT_REDUCEOP or not all_int(x.shape): return None
+  # Large reductions with many outputs can exceed the MSM hangcheck before a grouped kernel retires on a6xx.
+  # Split them earlier on QCOM so each dispatch has either a large grid or a large reduction, but not both.
+  split_threshold = 4096 if isinstance(x.device, str) and x.device.startswith("QCOM") and prod(reduce.shape) >= 1024 else 32768
+  if (prod(x.shape)//prod(reduce.shape)) < getenv("REDUCEOP_SPLIT_THRESHOLD", split_threshold): return None
   # if there are few globals, make some reduces into globals by splitting into two kernels
   # cap output buffer to 2**22: heuristic number of global outputs to achieve max occupancy with enough locals+upcasts for gemm
   #   ~2**10 should be enough if GROUP is used

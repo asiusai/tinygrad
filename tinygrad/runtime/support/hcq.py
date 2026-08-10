@@ -373,12 +373,16 @@ class HCQProgram(Program[HCQDeviceType]):
     q = unwrap(self.dev.hw_compute_queue_t)().wait(self.dev.timeline_signal, self.dev.timeline_value - 1).memory_barrier()
 
     self.dev.prof_exec_counter += 1
+    self.dev.last_prg_name = self.name
+    self.dev.last_prg_dims = (global_size, local_size)
+    if getenv("QCOM_LOG_DIMS"): print(f"QCOM {self.name} g={global_size} l={local_size}", flush=True)
     with hcq_profile(self.dev, queue=q, desc=self.name, enabled=wait or PROFILE) as (sig_st, sig_en):
       q.exec(self, kernargs, global_size, local_size)
 
     q.signal(self.dev.timeline_signal, self.dev.next_timeline()).submit(self.dev)
 
     if wait: self.dev.synchronize(timeout=timeout)
+    elif getenv("QCOM_SYNC_ALL"): self.dev.synchronize(timeout=timeout)
     return (float(sig_en.timestamp - sig_st.timestamp) / 1e6) if wait else None
 
 class HCQCompiled(Compiled, Generic[SignalType]):
@@ -436,6 +440,7 @@ class HCQCompiled(Compiled, Generic[SignalType]):
 
     try: self.timeline_signal.wait(self.timeline_value - 1, timeout=timeout if timeout is not None and self.can_recover else None)
     except RuntimeError as e:
+      if getenv("QCOM_HANG_NAME"): print(f"QCOM HANG: signal {self.timeline_value-1} not reached; last enqueued kernel = {getattr(self, 'last_prg_name', None)} dims={getattr(self, 'last_prg_dims', None)}", flush=True)
       self.error_state = e
       if hasattr(self, 'on_device_hang'): self.on_device_hang()
       raise e
