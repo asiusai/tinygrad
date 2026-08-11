@@ -1,4 +1,4 @@
-import ctypes, itertools, platform, struct, unittest
+import ctypes, itertools, math, platform, struct, unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -41,6 +41,16 @@ def make_compute_state(image_size=0x3280):
 
 
 class TestQCOM(unittest.TestCase):
+  def test_default_local_size_is_bounded_and_divisible(self):
+    from tinygrad.engine.realize import _qcom_default_local_size
+
+    self.assertEqual(_qcom_default_local_size((2500, 5, 5), 1024), (125, 1, 1))
+    self.assertEqual(_qcom_default_local_size((5, 12, 32), 256), (5, 12, 2))
+    for global_size, max_threads in [((1, 1, 1), 1024), ((17, 19, 23), 64), ((512, 256, 6), 32)]:
+      local_size = _qcom_default_local_size(global_size, max_threads)
+      self.assertLessEqual(math.prod(local_size), min(128, max_threads))
+      self.assertTrue(all(g % l == 0 for g,l in zip(global_size, local_size)))
+
   def test_private_memory_register_units(self):
     from tinygrad.runtime.ops_qcom import _qcom_pvtmem_sizes
 

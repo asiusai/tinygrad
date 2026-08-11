@@ -347,7 +347,9 @@ class Transformer:
 
     arch = kv['general.architecture']
     max_context = min(max_context, kv[f'{arch}.context_length']) if max_context is not None else kv[f'{arch}.context_length']
-    n_heads, n_kv_heads = kv[f'{arch}.attention.head_count'], kv[f'{arch}.attention.head_count_kv']
+    n_heads = kv[f'{arch}.attention.head_count']
+    # Older GGUF files omit head_count_kv for ordinary multi-head attention, where every query head has its own K/V head.
+    n_kv_heads = kv.get(f'{arch}.attention.head_count_kv', n_heads)
 
     ssm = None
     ssm_layers: tuple[bool, ...] = ()
@@ -390,7 +392,8 @@ class Transformer:
       n_heads=n_heads, n_kv_heads=n_kv_heads, norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'],
       vocab_size=len(kv['tokenizer.ggml.tokens']),
       head_dim=head_dim,
-      rope_theta=kv[f'{arch}.rope.freq_base'],
+      # GGUF predating rope.freq_base uses the original RoPE default.
+      rope_theta=kv.get(f'{arch}.rope.freq_base', 10000.0),
       rope_dim=rope_dim,
       v_head_dim=kv.get(f'{arch}.attention.value_length_mla', kv.get(f'{arch}.attention.value_length', head_dim)),
       max_context=max_context,

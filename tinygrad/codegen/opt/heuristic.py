@@ -92,12 +92,15 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # if there are small dims with lots of valid masks, upcast them (they might be from Tensor.stack)
   to_upcast: list[int] = []
+  # IR3 spills larger masked-axis accumulator arrays to private memory. On Adreno 6xx,
+  # the resulting high-register kernels can hang the GPU instead of merely running slowly.
+  masked_upcast_max = 1 if k.ren.target.device == "QCOM" else 7 * 7
   where_gate_rngs = {r for u in k.ast.backward_slice if u.op is Ops.WHERE for r in u.src[0].ranges}
   # upcast leading axes first (hack-ish for winograd; we actually want to upcast masked axes with low stride first)
   for axis in k.upcastable_dims:
     # for Schedule, we check if the range is used in INDEX gates or WHERE gates
     is_masked = k.rngs[axis] in where_gate_rngs
-    if k.full_shape[axis] <= 7 and is_masked and prod(k.full_shape[j] for j in to_upcast) * k.full_shape[axis] <= 7 * 7:
+    if k.full_shape[axis] <= 7 and is_masked and prod(k.full_shape[j] for j in to_upcast) * k.full_shape[axis] <= masked_upcast_max:
       # upcasting a masked global axis moves that range out of the launch grid into each work-item
       # under IMAGE, skip the upcast unless enough global work-items remain after it to hide memory latency
       if IMAGE and k.axis_types[axis] is AxisType.GLOBAL:
@@ -139,11 +142,19 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # if last reduce dim is small(ish), loop unroll the reduce
   # NOTE: this can fail on multireduce with mismatching dimensions, this is okay
   try:
-    if k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
+    # QCOM image vectorization can already have unrolled a reduction axis. A second reduction unroll creates
+    # large fused expressions that IR3 compiles with unsafe register pressure, so retain the remaining loop.
+    qcom_has_unroll = k.ren.target.device == "QCOM" and bool(k.axes_of(AxisType.UNROLL))
+    if k.unrollable_dims and not qcom_has_unroll and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
       if (s:=k.full_shape[k.unrollable_dims[-1]]) <= 32:
-        k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
+        # Fully unrolling 9-32 iterations can push IR3 into high-register kernels that watchdog on Adreno 6xx.
+        # A partial unroll retains vectorization without materializing the whole reduction in each work-item.
+        if s <= (8 if k.ren.target.device == "QCOM" else 32):
+          k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
+        elif s % 4 == 0:
+          k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 4))
         # if it's small, upcast a second reduce dimension too
-        if k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3:
+        if s <= 3 and k.unrollable_dims and k.full_shape[k.unrollable_dims[-1]] <= 3:
           k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
       else:
         for splits in [4]:

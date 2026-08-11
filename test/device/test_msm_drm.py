@@ -101,10 +101,21 @@ class TestMSMIface(unittest.TestCase):
 
     self.assertIs(iface.fd, fd)
     self.assertEqual((iface.gpu_id, iface.mesa_gpu_id), ((6, 3, 5), 0))
-    self.assertEqual(iface.submit_flags, msm_drm.MSM_PIPE_3D0 | msm_drm.MSM_SUBMIT_SUDO)
+    self.assertEqual(iface.submit_flags, msm_drm.MSM_PIPE_3D0)
     self.assertEqual(fd.new_queues, [(msm_drm.MSM_SUBMITQUEUE_VM_BIND, 0), (0, 0)])
     self.assertLess(fd.requests.index(ioctl_number(msm_drm.DRM_IOCTL_MSM_SET_PARAM)),
                     fd.requests.index(ioctl_number(msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_NEW)))
+
+  def test_init_allows_explicit_sudo_submits(self):
+    from tinygrad.runtime.ops_qcom import MSMIface
+
+    fd = RecordingMSMFile()
+    with patch("tinygrad.runtime.ops_qcom.getenv", return_value=1), \
+         patch("tinygrad.runtime.ops_qcom.glob.glob", return_value=["/dev/dri/renderD128"]), \
+         patch("tinygrad.runtime.ops_qcom.FileIOInterface", return_value=fd):
+      iface = MSMIface(SimpleNamespace(), 0)
+
+    self.assertEqual(iface.submit_flags, msm_drm.MSM_PIPE_3D0 | msm_drm.MSM_SUBMIT_SUDO)
 
   def test_init_rejects_unvalidated_gpu(self):
     from tinygrad.runtime.ops_qcom import MSMIface

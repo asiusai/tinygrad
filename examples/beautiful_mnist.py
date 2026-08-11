@@ -39,7 +39,14 @@ if __name__ == "__main__":
   for i in (t:=trange(getenv("STEPS", 70))):
     GlobalCounters.reset()   # NOTE: this makes it nice for DEBUG=2 timing
     loss = model.train_step(X_train, Y_train)
-    if i%10 == 9: test_acc = model.get_test_acc(X_test, Y_test).item()
+    if i%10 == 9:
+      # Small eval batches reduce peak memory and keep individual dispatches below watchdog limits on embedded GPUs.
+      eval_bs = getenv("EVAL_BS", X_test.shape[0])
+      test_correct = 0.0
+      for j in range(0, X_test.shape[0], eval_bs):
+        x, y = X_test[j:j+eval_bs].contiguous().realize(), Y_test[j:j+eval_bs].contiguous().realize()
+        test_correct += model.get_test_acc(x, y).item() * min(eval_bs, X_test.shape[0]-j)
+      test_acc = test_correct / X_test.shape[0]
     t.set_description(f"loss: {loss.item():6.2f} test_accuracy: {test_acc:5.2f}%")
 
   # verify eval acc

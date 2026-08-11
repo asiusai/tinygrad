@@ -485,7 +485,8 @@ class MSMIface:
     self.gpu_id = (chip_id >> 24, (chip_id >> 16) & 0xff, (chip_id >> 8) & 0xff)
     if self.gpu_id not in {(6, 3, 0), (6, 3, 5)}:
       raise RuntimeError(f"MSM DRM requires a validated Adreno 630/635, got chip_id={self.chip_id:#x}")
-    self.submit_flags = msm_drm.MSM_PIPE_3D0 | (msm_drm.MSM_SUBMIT_SUDO if self.gpu_id == (6, 3, 5) else 0)
+    # SUDO submits are rejected by the production A635 kernel unless explicitly enabled by the system integrator.
+    self.submit_flags = msm_drm.MSM_PIPE_3D0 | (msm_drm.MSM_SUBMIT_SUDO if self.gpu_id == (6, 3, 5) and getenv("QCOM_SUDO") else 0)
     va_start = msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_VA_START).value
     va_size = msm_drm.DRM_IOCTL_MSM_GET_PARAM(self.fd, pipe=msm_drm.MSM_PIPE_3D0, param=msm_drm.MSM_PARAM_VA_SIZE).value
     self.va_allocator = TLSFAllocator(va_size, base=va_start, block_size=mmap.PAGESIZE)

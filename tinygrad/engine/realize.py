@@ -84,6 +84,16 @@ def track_stats(ctx:ExecContext, call:UOp, device:str, bufs:list[Buffer], var_va
     first_run_cache.add(call.src[0].key)
 
 local_size_cache: dict[bytes, tuple[int, ...]] = {}
+def _qcom_default_local_size(global_size:tuple[int, ...], max_threads:int) -> tuple[int, ...]:
+  # Runtime benchmarking can submit a very slow workgroup candidate and trip MSM's non-preemptible-job watchdog.
+  # Fill dimensions with exact divisors instead; 128 threads is a conservative A6xx occupancy ceiling.
+  remaining, local_size = max(1, min(128, max_threads)), []
+  for global_dim in global_size:
+    local_dim = max(x for x in range(1, min(global_dim, remaining)+1) if global_dim % x == 0)
+    local_size.append(local_dim)
+    remaining //= local_dim
+  return tuple(local_size)
+
 def optimize_local_size(call:UOp, prg:UOp) -> UOp|None:
   device = to_tuple(prg.device)[0]
   if prg.arg.local_size is not None or not Device[device].renderer.has_local or not all_int(prg.arg.global_size): return None
@@ -91,19 +101,23 @@ def optimize_local_size(call:UOp, prg:UOp) -> UOp|None:
   if (local_size:=local_size_cache.get(prg.key)) is None:
     # reuse one loaded runtime across candidates, only launch dims vary
     bufs, runtime = [b.allocate() for b in bufs_from_ast(prg.src[0], device)], get_runtime(device, prg, cache=False)
-    def try_exec(local_size):
-      try:
-        new_gs = tuple(g//l if g%l == 0 else g/l for g,l in zip(prg.arg.global_size, local_size))
-        return runtime(*[bufs[i].get_buf(device) for i in prg.arg.globals], global_size=new_gs, local_size=(*local_size,),
-                       vals=prg.arg.vals({}), wait=True)
-      except Exception: return float('inf')
+    if device.split(":", 1)[0] == "QCOM":
+      local_size = _qcom_default_local_size(prg.arg.global_size, runtime.max_threads)
+      local_size_cache[prg.key] = local_size
+    else:
+      def try_exec(local_size):
+        try:
+          new_gs = tuple(g//l if g%l == 0 else g/l for g,l in zip(prg.arg.global_size, local_size))
+          return runtime(*[bufs[i].get_buf(device) for i in prg.arg.globals], global_size=new_gs, local_size=(*local_size,),
+                         vals=prg.arg.vals({}), wait=True)
+        except Exception: return float('inf')
 
-    MAX_WORKGROUP = 1024
-    local_dims = [[x for x in set([sz, 1, 2, 4, 8, 16, 32, 64, 128, 256, MAX_WORKGROUP]) if x<=sz] for sz in prg.arg.global_size]
-    local_sizes = [list(x) for x in itertools.product(*local_dims) if prod(x) <= MAX_WORKGROUP] * 2  # try each valid size twice
-    best_time, best = min([(try_exec(ls), ls) for ls in random.sample(local_sizes, len(local_sizes))])
-    assert not math.isinf(best_time), "all optimize_local_size exec failed"
-    local_size = local_size_cache[prg.key] = tuple(best)
+      MAX_WORKGROUP = 1024
+      local_dims = [[x for x in set([sz, 1, 2, 4, 8, 16, 32, 64, 128, 256, MAX_WORKGROUP]) if x<=sz] for sz in prg.arg.global_size]
+      local_sizes = [list(x) for x in itertools.product(*local_dims) if prod(x) <= MAX_WORKGROUP] * 2  # try each valid size twice
+      best_time, best = min([(try_exec(ls), ls) for ls in random.sample(local_sizes, len(local_sizes))])
+      assert not math.isinf(best_time), "all optimize_local_size exec failed"
+      local_size = local_size_cache[prg.key] = tuple(best)
 
   new_global = tuple(g//l if g%l == 0 else g/l for g,l in zip(prg.arg.global_size, local_size))
   return call.replace(src=(prg.replace(arg=replace(prg.arg, global_size=new_global, local_size=local_size)), *call.src[1:]))
