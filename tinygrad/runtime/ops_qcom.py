@@ -6,6 +6,7 @@ from typing import Any
 from tinygrad.device import BufferSpec, Device, TinyELF
 from tinygrad.runtime.support.hcq import HCQBuffer, HWQueue, HCQProgram, HCQCompiled, HCQAllocatorBase, HCQSignal, HCQArgsState, BumpAllocator
 from tinygrad.runtime.support.hcq import FileIOInterface, MMIOInterface
+from tinygrad.runtime.graph.hcq import HCQGraph
 from tinygrad.runtime.support.memory import TLSFAllocator
 from tinygrad.runtime.autogen import kgsl, mesa, msm_drm
 from tinygrad.renderer.cstyle import QCOMCLRenderer
@@ -467,6 +468,8 @@ class MSMIface:
   count = 1
   renderers = [IR3Renderer]
   event_write_irq = True
+  # Long kernel sequences can hang A635 when too many independent submits are queued.
+  max_inflight = 8
 
   def __init__(self, dev:QCOMDevice, device_id:int):
     if device_id != 0: raise RuntimeError(f"QCOM:{device_id} does not exist (1 MSM DRM device available)")
@@ -517,7 +520,7 @@ class MSMIface:
   def alloc(self, size:int, uncached=False, fill_zeroes=False) -> HCQBuffer:
     if size <= 0: raise ValueError(f"MSM allocation size must be positive, got {size}")
     mapped_size = round_up(size, mmap.PAGESIZE)
-    gem = msm_drm.DRM_IOCTL_MSM_GEM_NEW(self.fd, size=mapped_size, flags=msm_drm.MSM_BO_WC)
+    gem = msm_drm.DRM_IOCTL_MSM_GEM_NEW(self.fd, size=mapped_size, flags=msm_drm.MSM_BO_CACHED_COHERENT)
     allocation = self._new_allocation(gem.handle, mapped_size)
     try:
       offset = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=gem.handle, info=msm_drm.MSM_INFO_GET_OFFSET).value
@@ -561,6 +564,8 @@ class MSMIface:
     del self.allocations[allocation.handle]
 
   def submit(self, command:HCQBuffer, size:int) -> int:
+    if self.dev.timeline_value > self.max_inflight + 1:
+      self.dev.timeline_signal.wait(self.dev.timeline_value - self.max_inflight - 1)
     cmd = msm_drm.struct_drm_msm_gem_submit_cmd(type=msm_drm.MSM_SUBMIT_CMD_BUF, size=size, iova=int(command.va_addr))
     submit = msm_drm.struct_drm_msm_gem_submit(flags=self.submit_flags, nr_cmds=1, cmds=ctypes.addressof(cmd), queueid=self.queue_id)
     msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT(self.fd, __payload=submit)
@@ -577,6 +582,13 @@ class MSMIface:
   def device_fini(self):
     msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_CLOSE(self.fd, self.queue_id)
     msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_CLOSE(self.fd, self.vm_bind_queue_id)
+
+class QCOMGraph(HCQGraph):
+  @staticmethod
+  def supports_uop(batch_devs, new_call):
+    all_devs = QCOMGraph._all_devs(batch_devs, new_call)
+    return all(not isinstance(getattr(d, "iface", None), MSMIface) or getenv("OPENPILOT_HACKS") for d in all_devs) \
+      and HCQGraph.supports_uop(batch_devs, new_call)
 
 class QCOMDevice(HCQCompiled):
   ifaces = [KGSLIface, MSMIface]
@@ -601,6 +613,7 @@ class QCOMDevice(HCQCompiled):
     arch = ("a%d%d%d,GPU_ID=%d,CHIP_ID=%#x" % (*self.gpu_id, mesa_gpu_id, self.iface.chip_id)) + \
            (",IMAGE_PITCH_ALIGNMENT=64" if IMAGE else "")
     super().__init__(device, QCOMAllocator(self), self.iface.renderers, QCOMProgram, QCOMSignal, functools.partial(QCOMComputeQueue, self), arch=arch)
+    self.graph = QCOMGraph
 
   def _ensure_stack_size(self, sz):
     if not hasattr(self, '_stack'): self._stack = self.iface.alloc(sz)

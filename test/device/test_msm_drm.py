@@ -17,7 +17,7 @@ class RecordingMSMFile(FileIOInterface):
   def __init__(self, name=b"msm"):
     self.name, self.memory = name, bytearray([0xaa] * mmap.PAGESIZE)
     self.cpu_addr = mv_address(memoryview(self.memory))
-    self.requests, self.mmaps, self.unmaps, self.closed_handles = [], [], [], []
+    self.requests, self.mmaps, self.unmaps, self.closed_handles, self.gem_flags = [], [], [], [], []
     self.binds, self.submissions, self.waits, self.new_queues, self.closed_queues = [], [], [], [], []
     self.bind_errno = self.wait_errno = None
     self.chip_id, self.gpu_id, self.import_handle = 0xac06030500, 0, 19
@@ -29,7 +29,9 @@ class RecordingMSMFile(FileIOInterface):
     if request == ioctl_number(msm_drm.DRM_IOCTL_VERSION):
       ctypes.memmove(arg.name, self.name, min(len(self.name), arg.name_len))
       arg.name_len = len(self.name)
-    elif request == ioctl_number(msm_drm.DRM_IOCTL_MSM_GEM_NEW): arg.handle = 17
+    elif request == ioctl_number(msm_drm.DRM_IOCTL_MSM_GEM_NEW):
+      self.gem_flags.append(arg.flags)
+      arg.handle = 17
     elif request == ioctl_number(msm_drm.DRM_IOCTL_PRIME_FD_TO_HANDLE): arg.handle = self.import_handle
     elif request == ioctl_number(msm_drm.DRM_IOCTL_MSM_GET_PARAM):
       arg.value = {msm_drm.MSM_PARAM_GPU_ID: self.gpu_id, msm_drm.MSM_PARAM_CHIP_ID: self.chip_id,
@@ -69,7 +71,7 @@ def make_iface(fd):
   from tinygrad.runtime.support.memory import TLSFAllocator
 
   iface = object.__new__(MSMIface)
-  iface.dev, iface.fd = SimpleNamespace(last_cmd=0), fd
+  iface.dev, iface.fd = SimpleNamespace(last_cmd=0, timeline_value=1, timeline_signal=SimpleNamespace(wait=lambda _: None)), fd
   iface.queue_id, iface.vm_bind_queue_id = 3, 2
   iface.submit_flags = msm_drm.MSM_PIPE_3D0 | msm_drm.MSM_SUBMIT_SUDO
   iface.va_allocator = TLSFAllocator(0x1000_0000, base=0x1234_0000, block_size=mmap.PAGESIZE)
@@ -137,6 +139,7 @@ class TestMSMIface(unittest.TestCase):
     self.assertEqual((buf.va_addr, buf.cpu_view().addr, buf.size), (0x1234_0000, fd.cpu_addr, 17))
     self.assertNotEqual(buf.va_addr, buf.cpu_view().addr)
     self.assertEqual(fd.memory[:17], bytes(17))
+    self.assertEqual(fd.gem_flags, [msm_drm.MSM_BO_CACHED_COHERENT])
     self.assertEqual(fd.mmaps, [(0, mmap.PAGESIZE, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, 0x8000)])
     self.assertEqual(fd.binds, [(msm_drm.MSM_VM_BIND_OP_MAP, 17, 0x1234_0000, mmap.PAGESIZE)])
 
@@ -189,6 +192,26 @@ class TestMSMIface(unittest.TestCase):
     self.assertEqual(iface.submit(command, 0x20), 42)
     self.assertEqual(fd.submissions, [(msm_drm.MSM_PIPE_3D0 | msm_drm.MSM_SUBMIT_SUDO, 3,
                                        [(msm_drm.MSM_SUBMIT_CMD_BUF, 0x20, 0x1000_0040)])])
+
+  def test_submit_bounds_inflight_work(self):
+    fd = RecordingMSMFile()
+    iface = make_iface(fd)
+    waits = []
+    iface.dev.timeline_value = 12
+    iface.dev.timeline_signal = SimpleNamespace(wait=waits.append)
+
+    iface.submit(HCQBuffer(0x1000_0040, 0x80), 0x20)
+
+    self.assertEqual(waits, [3])
+
+  def test_graph_capture_requires_openpilot_hacks(self):
+    from tinygrad.runtime.graph.hcq import HCQGraph
+    from tinygrad.runtime.ops_qcom import MSMIface, QCOMGraph
+
+    dev = SimpleNamespace(iface=object.__new__(MSMIface))
+    with patch.object(QCOMGraph, "_all_devs", return_value=[dev]), patch.object(HCQGraph, "supports_uop", return_value=True):
+      with patch("tinygrad.runtime.ops_qcom.getenv", return_value=0): self.assertFalse(QCOMGraph.supports_uop([], None))
+      with patch("tinygrad.runtime.ops_qcom.getenv", return_value=1): self.assertTrue(QCOMGraph.supports_uop([], None))
 
   def test_wait_fence_uses_absolute_deadline(self):
     from tinygrad.runtime.ops_qcom import MSM_WAIT_SLICE_NS
