@@ -596,7 +596,7 @@ class QCOMDevice(HCQCompiled):
 
   def __init__(self, device:str=""):
     self.device_id = int(device.split(":")[1]) if ":" in device else 0
-    self.iface = self._select_iface()
+    self.iface = self._select_iface(device)
     self.gpu_id = self.iface.gpu_id
 
     # a7xx start with 730x or 'Cxxx', a8xx starts 'Exxx'
