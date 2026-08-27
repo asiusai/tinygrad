@@ -1,12 +1,11 @@
 from __future__ import annotations
 import math, itertools
-from collections import defaultdict
-from typing import cast, Final
+from typing import cast
 from tinygrad.uop.ops import Ops, UOp, KernelInfo, graph_rewrite, AxisType, ssimplify, remove_all_tags
 from tinygrad.uop.ops import axis_letters, axis_colors, axis_to_pos
 from tinygrad.device import Buffer
 from tinygrad.dtype import dtypes, Invalid
-from tinygrad.helpers import colored, getenv, DEBUG, to_function_name, NOOPT, argsort, round_up, prod, merge_dicts, get_single_element, flatten
+from tinygrad.helpers import colored, getenv, DEBUG, NOOPT, argsort, round_up, prod, merge_dicts, get_single_element, flatten
 from tinygrad.helpers import ALLOW_TF32, count, Context
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError, check
 from tinygrad.codegen.simplify import pm_flatten_range
@@ -48,7 +47,6 @@ class Scheduler:
     if hasattr(self, 'tensor_core'): ret.tensor_core = self.tensor_core
     return ret
 
-  kernel_cnt: Final[defaultdict[str, int]] = defaultdict(int)
   def get_optimized_ast(self, name_override:str|None=None) -> UOp:
     if name_override is not None: name = name_override
     else:
@@ -56,9 +54,6 @@ class Scheduler:
       special_uops = sorted([x for x in self.ast.toposort() if x.op is Ops.SPECIAL], key=lambda x: x.arg)
       special_ops = [colored(str(x.vmax+1), "blue" if x.arg[0] == "g" else "cyan") for x in special_uops]
       name = k_type + colored('_', 'BLACK').join(['']+special_ops+[colored(x.src[0].render(), color) for x,color in zip(self.rngs, self.colors())])
-      Scheduler.kernel_cnt[(function_name := to_function_name(name))] += 1
-      num = f"n{Scheduler.kernel_cnt[function_name]-1}" if Scheduler.kernel_cnt[function_name] > 1 else ""
-      name += colored(num, 'BLACK')
     self.ast = graph_rewrite(self.ast, pm_flatten_range, name="flatten range")
     return self.ast.replace(arg=KernelInfo(name=name, applied_opts=tuple(self.applied_opts), dont_use_locals=self.dont_use_locals), tag=1)
 
@@ -198,7 +193,7 @@ class Scheduler:
       for b in self.bufs:
         if rng in (i:=b.src[1].get_idx()).backward_slice_with_self:
           nb = b.replace(src=(b.src[0], i.valid(valid&b.src[1].get_valid())))
-          replaces[b] = nb if b in store_targets else valid.where(nb, UOp.const(Invalid, b.dtype))
+          replaces[b] = nb if b in store_targets else valid.where(nb, UOp.const(Invalid))
       self.ast = self.ast.substitute(replaces, f"padto {rng.arg[:-1]} {opt.arg}")
     elif opt.op is OptOps.SWAP:
       try:
@@ -332,9 +327,9 @@ class Scheduler:
   @property
   def group_for_reduces(self) -> int: return len(self.axes_of(AxisType.GROUP_REDUCE))
 
-def bufs_from_ast(ast:UOp, dname:str) -> list[Buffer]:
+def args_from_ast(ast:UOp, dname:str) -> tuple[list[Buffer], dict[str, int]]:
   glbls = sorted([x for x in ast.backward_slice if x.op is Ops.PARAM and x.arg.slot >= 0], key=lambda x: x.arg.slot)
-  return [Buffer(dname, x.max_numel(), x.dtype) for x in glbls]
+  return [Buffer(dname, x.max_numel(), x.dtype) for x in glbls], {k.expr:int(k.vmax+k.vmin)//2 for k in ast.variables()}
 
 def apply_opts(ast:UOp, ren:Renderer, beam:int=0) -> UOp:
   if ast.tag is not None: return ast
@@ -344,10 +339,10 @@ def apply_opts(ast:UOp, ren:Renderer, beam:int=0) -> UOp:
     for opt in ast.arg.opts_to_apply: k.apply_opt(opt)
   elif beam >= 1:
     from tinygrad.codegen.opt.search import beam_search
-    rawbufs = bufs_from_ast(ast, ren.target.device)
+    rawbufs, var_vals = args_from_ast(ast, ren.target.device)
     # beam search may open devices
     with Context(ALLOW_DEVICE_USAGE=1):
-      k = beam_search(k, rawbufs, beam, bool(getenv("BEAM_ESTIMATE", 1)))
+      k = beam_search(k, rawbufs, var_vals, beam, bool(getenv("BEAM_ESTIMATE", 1)))
   elif not NOOPT and (ast.arg is None or ast.arg.applied_opts == ()):
     from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
     # NOTE: hand_coded_optimizations doesn't support multiblock opts yet

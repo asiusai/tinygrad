@@ -46,6 +46,16 @@ class MovementMixin:
     """
     return prod(self.shape)
 
+  @property
+  def max_shape(self) -> tuple[int, ...]:
+    """The shape with every symbolic dimension replaced by its maximum."""
+    from tinygrad.uop.ops import to_max_shape  # deferred: ops.py imports the mixins
+    return to_max_shape(self.shape)
+
+  def max_numel(self) -> int:
+    """The number of elements in `max_shape`."""
+    return prod(self.max_shape)
+
   def size(self, dim:int|None=None) -> sint|tuple[sint, ...]:
     """
     Returns the size of the tensor. If `dim` is specified, return the length along dimension `dim`. Otherwise return the shape of the tensor.
@@ -268,7 +278,8 @@ class MovementMixin:
     return self.shrink(tuple([None if ns is None else (0, ns) for ns in argfix(shape, *args)]))
 
   def pad_to(self, shape, *args) -> Self:
-    return self._mop(Ops.PAD, tuple((0, s if ns is None else ns) for s,ns in zip(self.shape, argfix(shape, *args), strict=True)))
+    ret = self._mop(Ops.PAD, tuple((0, s if ns is None else ns) for s,ns in zip(self.shape, argfix(shape, *args), strict=True)))
+    return self if ret.shape == self.shape else ret
 
   def view(self, shape, *args) -> Self:
     """`.view` is an alias for `.reshape`."""
@@ -539,6 +550,7 @@ class MovementMixin:
     if dims is None: return self.flatten().roll(shifts, 0).reshape(self.shape)
     dims, shifts = tuple(self._resolve_dim(d) for d in make_tuple(dims, 1)), make_tuple(shifts, 1)
     if len(dims) != len(shifts): raise RuntimeError(f"{len(dims)=} != {len(shifts)=}")
+    if 0 in self.shape: return self
     shrink_arg: list[tuple[sint, sint]|None] = [None] * self.ndim
     for d, s in zip(dims, shifts): shrink_arg[d] = (delta:=self.shape[d]-s%self.shape[d], delta+self.shape[d])
     return self.repeat(*tuple(2 if i in dims else 1 for i in range(self.ndim))).shrink(tuple(shrink_arg))

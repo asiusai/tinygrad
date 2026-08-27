@@ -32,8 +32,8 @@ def validate_index(uidx:UOp, gate:UOp|None=None):
   from tinygrad.uop.validate import validate_index_with_z3
   return validate_index_with_z3(sz, idx, gate)
 
-def type_verify(ast:UOp|list[UOp], check_spec:PatternMatcher):
-  lst = list(ast.toposort()) if isinstance(ast, UOp) else ast
+def type_verify(ast:UOp|list[UOp], check_spec:PatternMatcher, enter_calls=True):
+  lst = list(ast.toposort(enter_calls=enter_calls)) if isinstance(ast, UOp) else ast
   if SPEC > 1: test_pyrender(lst[-1])  # assume this is the sink
 
   with Context(TRACK_MATCH_STATS=0):
@@ -68,8 +68,10 @@ spec_shared = PatternMatcher([
   (UPat(GroupOp.Comparison, dtype=dtypes.bool, src=(UPat.var("x"), UPat.var("y"))),
    lambda x,y: matches_dtype(x, y.dtype) or matches_dtype(y, x.dtype) or x.dtype in dtypes.weaks or y.dtype in dtypes.weaks),
   (UPat((Ops.AND, Ops.OR, Ops.XOR, Ops.SHL, Ops.SHR), name="x"), lambda x: False if any(dtypes.is_float(s.dtype) for s in x.src) else None),
-  (UPat((Ops.SHL, Ops.SHR), src=(UPat.var("x"), UPat(dtype=dtypes.uint)), name="a"), lambda a,x: matches_dtype(x, a.dtype) or None),
-  (UPat((Ops.CDIV, Ops.CMOD, Ops.FLOORDIV, Ops.FLOORMOD), name="x"), lambda x: None if dtypes.is_int(x.dtype) else False),
+  (UPat((Ops.SHL, Ops.SHR), src=(UPat.var("x"), UPat.var("c")), name="a"), lambda a,x,c: (matches_dtype(x, a.dtype) or x.dtype is dtypes.weakint)
+   and (matches_dtype(c, a.dtype) or c.dtype in (dtypes.uint, dtypes.weakint) or x.base.is_invalid)),
+  (UPat((Ops.CDIV, Ops.CMOD, Ops.FLOORDIV, Ops.FLOORMOD), name="x"),
+   lambda x: None if dtypes.is_int(x.dtype) or any(s.base.is_invalid for s in x.src) else False),
   (UPat(GroupOp.ALU, name="x"), lambda x: all(matches_dtype(y, x.dtype) or y.dtype in dtypes.weaks for y in x.src)),
 
   # CAST
@@ -98,8 +100,9 @@ spec_shared = PatternMatcher([
                                                      Ops.AFTER, Ops.UNSHARD, Ops.BITCAST, Ops.INS})),),
         allow_any_len=True, name="x"), lambda x: matches_dtype(x.src[0], x.dtype)),
 
-  # CUSTOM (inline and non inline)
-  (UPat((Ops.CUSTOMI, Ops.CUSTOM)), lambda: True),
+  # CUSTOM (inline and non inline): the arg is the source string and the dtype it produces, void for a bare statement
+  (UPat((Ops.CUSTOMI, Ops.CUSTOM), name="x"),
+   lambda x: isinstance(x.arg, tuple) and len(x.arg) == 2 and isinstance(x.arg[0], str) and isinstance(x.arg[1], DType)),
 
   # CALL of an external function
   (UPat(Ops.CALL, src=(UPat(),), allow_any_len=True, name="x"),
@@ -134,16 +137,16 @@ def valid_gettuple(g:UOp, t:UOp): return isinstance(g.arg, int) and 0 <= g.arg <
 
 # these ops can exist in tensor but not programs. example: movement
 spec_tensor = PatternMatcher([
-  (UPat((Ops.SIN, Ops.LOG2, Ops.EXP2, Ops.SQRT, Ops.RECIPROCAL), src=(UPat(),), name="u"), lambda u: dtypes.is_float(u.dtype)),
+  (UPat((Ops.SIN, Ops.LOG2, Ops.EXP2, Ops.SQRT, Ops.RECIPROCAL), src=(UPat(),), name="u"),
+   lambda u: dtypes.is_float(u.dtype) or u.src[0].base.is_invalid),
 
   # BUFFER
   (UPat(Ops.BUFFER, src=(UPat(),), name="buf"), lambda buf:
    (isinstance(buf.dtype, DType) and matches_dtype(buf.src[0], dtypes.weakint) and is_device(buf.arg.device))
    if isinstance(buf.arg, ParamArg) and buf.addrspace is AddrSpace.GLOBAL else None),
 
-  # Tensor variable bindings
-  (UPat(Ops.BIND, (dtypes.int, dtypes.long, dtypes.weakint,), (UPat(Ops.PARAM), UPat.cvar(dtype=(dtypes.int,dtypes.long,dtypes.weakint,))), arg=None),
-   lambda: True),
+  # a Variable is a 0-d ALU BUFFER with a value range and no device
+  (UPat(Ops.BUFFER, src=(UPat(),), name="buf"), lambda buf: buf.arg.device is None if buf.is_variable else None),
 
   # custom function
   (UPat(Ops.CUSTOM_FUNCTION, name="x"), lambda x: isinstance(x.arg, str)),
@@ -201,11 +204,12 @@ spec_tensor = PatternMatcher([
 
 # these ops can exist in programs but not the tensor spec. example: LOAD
 spec_program = PatternMatcher([
-  # index and weak dtypes are not allowed in programs
-  (UPat(GroupOp.All, (dtypes.weakint, dtypes.weakfloat)), lambda: False),
+  # every width in a program is stated: a CONST appears only under the CAST stating its width, and is the only weak node
+  (UPat(GroupOp.All, name="x"), lambda x: False if x.op is not Ops.CAST and any(s.op is Ops.CONST for s in x.src) else None),
+  (UPat(GroupOp.All-{Ops.CONST}, dtypes.weaks), lambda: False),
 
   # allow special SHRINK
-  (UPat(Ops.SHRINK, src=(UPat((Ops.PARAM, Ops.BUFFER, Ops.AFTER)), UPat(), UPat(Ops.CONST))), lambda: True),
+  (UPat(Ops.SHRINK, src=(UPat((Ops.PARAM, Ops.BUFFER, Ops.AFTER)), UPat(), UPat(Ops.CONST).or_casted())), lambda: True),
 
   # movement ops are not allowed in programs
   (UPat(GroupOp.Movement), lambda: False),
@@ -233,13 +237,6 @@ spec_hcq = PatternMatcher([
 spec_full = PatternMatcher([
   (UPat(Ops.REWRITE_ERROR, dtypes.void, name="x"), lambda x: isinstance(x.arg, str)),
 
-  # SLICE on BUFFER is allowed if BUFFER is
-  (UPat(Ops.SLICE, src=(UPat(GroupOp.Movement.union({Ops.BUFFER, Ops.PARAM, Ops.STAGE, Ops.AFTER})),
-                        UPat(Ops.CONST, dtype=dtypes.weakint)), allow_any_len=True, name="bv"),
-   lambda bv: isinstance(bv.arg, int)),
-
-  (UPat(Ops.CALL, dtypes.void, src=(UPat((Ops.SLICE,)),), allow_any_len=True), lambda: True),
-
   # codegen may end ranges after gpudims has replaced RANGE with SPECIAL.
   (UPat(Ops.END, src=(UPat(), UPat()), allow_any_len=True), lambda: True),
 
@@ -248,20 +245,46 @@ spec_full = PatternMatcher([
 
   # all loads/stores
   (UPat((Ops.LOAD, Ops.STORE)), lambda: True),
-
-  # while BIND is being casted
-  (UPat(Ops.BIND, (dtypes.int, dtypes.weakint), (UPat(), UPat()), arg=None), lambda: True),
 ])+spec_tensor+spec_program+spec_hcq
+
+# ***** kernel graph spec *****
+
+spec_kernel_graph = PatternMatcher([
+  # sink
+  (UPat(Ops.SINK, dtypes.void), lambda: True),
+  # the store of a bound Variable binds it: AFTER(BUFFER, STORE(BUFFER, CONST)) in call args
+  (UPat(Ops.STORE, dtypes.void, (UPat(Ops.BUFFER, name="b"), UPat(Ops.CONST))), lambda b: b.is_variable),
+  # const + stack to make vconsts and shape args. a 0-size/bound reduce keeps its const casted
+  (UPat(Ops.CONST, src=()), lambda: True),
+  (UPat(Ops.CAST, src=(UPat(Ops.CONST, src=()),)), lambda: True),
+  (UPat(Ops.STACK, name="s"), lambda s: all(x.op in (Ops.CONST, Ops.PARAM) or x.is_variable or x.is_bound_var for x in s.src) or None),
+  # linear for more kernels (TODO: we should enter non sink calls)
+  #(UPat(Ops.LINEAR), lambda: True),
+  # param is outside buffer, buffer is local buffer
+  (UPat(Ops.PARAM, name="x"), lambda x: isinstance(x.arg, ParamArg)),
+  (UPat(Ops.BUFFER, name="x"), lambda x: isinstance(x.arg, ParamArg) and x.addrspace in (AddrSpace.GLOBAL, AddrSpace.ALU)),
+  # RESHAPE/BITCAST are NOOPs in the kernel graph (do we need them?)
+  (UPat((Ops.RESHAPE, Ops.BITCAST)), lambda: True),
+  # mstack/mselect
+  (UPat(Ops.MSTACK, name="x"), lambda x: all(isinstance(s.device, str) for s in x.src) or (all_same(x.src) and x.src[0].device is None)),
+  (UPat(Ops.MSELECT, name="x"), lambda x: isinstance(x.src[0].device, tuple) and x.arg < len(x.src[0].device)),
+  # all calls are on various sinks
+  (UPat(Ops.CALL, src=(UPat((Ops.SINK, Ops.LINEAR, Ops.PROGRAM, Ops.CUSTOM_FUNCTION)),), allow_any_len=True), lambda: True),
+  # after on PARAM or AFTER
+  (UPat(Ops.AFTER, src=(UPat(GroupOp.Movement.union({Ops.PARAM, Ops.AFTER, Ops.BUFFER, Ops.MSTACK, Ops.MSELECT, Ops.BITCAST, Ops.RESHAPE})),),
+        allow_any_len=True, name="x"), lambda x: matches_dtype(x.src[0], x.dtype)),
+])
 
 # **** pyrender (move this) ****
 
 # late imports to avoid circular import
 from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.schedule.rangeify import BufferizeOpts
+from tinygrad.renderer import Estimates
 glbls:dict[str, Any] = {"inf": math.inf, "nan": math.nan, "KernelInfo": KernelInfo, "Metadata": Metadata,
                         "UOp": UOp, "dtypes": dtypes, "Ops": Ops, "AxisType": AxisType, "Invalid": Invalid,
                         "Opt": Opt, "OptOps": OptOps, "BufferizeOpts": BufferizeOpts, "AddrSpace": AddrSpace, "panic": panic,
-                        "ConstFloat": ConstFloat, "ParamArg": ParamArg}
+                        "ConstFloat": ConstFloat, "ParamArg": ParamArg, "Estimates": Estimates}
 def eval_pyrender(code:str) -> UOp:
   lcls:dict[str, Any] = {}
   exec(code, glbls, lcls)

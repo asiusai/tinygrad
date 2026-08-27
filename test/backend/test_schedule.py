@@ -147,7 +147,7 @@ class TestSchedule(unittest.TestCase):
     devs = ("CPU:0", "CPU:1")
     x = Tensor.ones(2, device="CPU").shard(devs, axis=0).realize()
     out = (x.sum()*2).reshape(1).to("CPU")
-    run_linear(*check_schedule(out, 5))
+    run_linear(*check_schedule(out, 3))
     np.testing.assert_equal(out.numpy(), [4.])
 
 class TestLimitBufs(unittest.TestCase):
@@ -176,7 +176,7 @@ class TestLimitBufs(unittest.TestCase):
 
   def test_limit_bufs_linear_scaling(self):
     def sched_time(n):
-      with Context(TRACK_MATCH_STATS=0, DEBUG=0):
+      with Context(TRACK_MATCH_STATS=0, DEBUG=0, PARALLEL=0):
         bufs = [Tensor.ones(16).contiguous().realize() for _ in range(4)]
         root = bufs[0]
         for i in range(n): root = root + bufs[i % 4]

@@ -5,10 +5,11 @@ from examples.mlperf.models.flat_llama import FP8_DTYPE, quantize_fp8
 from extra.llama_kernels.fused_ce import fused_ce_loss
 from extra.llama_kernels import local_abs_max
 from extra.llama_kernels.quantize_fp8_delayed import quantize_fp8_delayed, quantize_fp8_scalar
+from extra.llama_kernels.swiglu import swiglu
 from extra.models.llama import apply_rotary_emb, precompute_freqs_cis
 from extra.thunder.amd.fa import custom_fused_qkv_rope_backward, fused_qkv_rope
 from test.helpers import needs_second_gpu, assert_kernel_count
-from test.backend.test_asm_gemm import has_hipcc
+from test.backend.test_asm_gemm import has_hipcc, is_cdna4
 
 def run_fused_ce(bs:int, seqlen:int, vocab:int, label_smoothing:float=0.0) -> None:
   Tensor.manual_seed(0)
@@ -98,22 +99,20 @@ class TestLocalAmax(unittest.TestCase):
     assert_kernel_count(2)
     self.assertEqual(out.tolist(), [[0., 7., 14., 21.], [28., 35., 42., 49.], [120., 135., 150., 165.], [180., 195., 210., 225.]])
 
-@unittest.skipUnless(has_hipcc() and Device.DEFAULT == "AMD", "requires hipcc to compile and amd device to run")
 class TestFusedQKVRoPE(unittest.TestCase):
   SHAPE = (2, 8192, 32, 8, 128)
+
+  def setUp(self):
+    if dtypes.bfloat16 not in Device[Device.DEFAULT].renderer.supported_dtypes(): self.skipTest("test uses bf16 inputs")
 
   def rand_bf16(self, *shape:int) -> Tensor:
     return (Tensor.randn(*shape) * 0.1).cast(dtypes.bfloat16).contiguous().realize()
 
-  def freqs_cis(self) -> Tensor:
-    _, N, _, _, D = self.SHAPE
-    return precompute_freqs_cis(D, N * 2).cast(dtypes.bfloat16).clone().realize()
-
-  def test_llama31_8b_forward(self):
+  def test_forward(self):
     Tensor.manual_seed(0)
-    B, N, H, H_KV, D = self.SHAPE
+    B, N, H, H_KV, D = 1, 32, 8, 2, 16
     GROUP = H // H_KV
-    freqs_cis = self.freqs_cis()
+    freqs_cis = (Tensor.randn(1, N * 2, 1, D // 2, 2) * 0.1).cast(dtypes.bfloat16).contiguous().realize()
 
     x = self.rand_bf16(B, N, H_KV * (GROUP + 2) * D)
     q, k, v = fused_qkv_rope(x, freqs_cis, H, H_KV, D)
@@ -130,12 +129,13 @@ class TestFusedQKVRoPE(unittest.TestCase):
       self.assertTrue(k.allclose(k_ref, atol=2e-2, rtol=0).item(), "K forward mismatch")
       self.assertTrue(v.allclose(v_ref, atol=0, rtol=0).item(), "V forward mismatch")
 
-  def test_llama31_8b_backward(self):
+  @unittest.skipUnless(has_hipcc() and is_cdna4(), "backward kernel requires hipcc to compile")
+  def test_llama31_8b(self):
     Tensor.manual_seed(1)
     B, N, H, H_KV, D = self.SHAPE
     PARTIALS = 2
     GROUP = H // H_KV
-    freqs_cis = self.freqs_cis()
+    freqs_cis = precompute_freqs_cis(D, N * 2).cast(dtypes.bfloat16).clone().realize()
     dq = self.rand_bf16(B, N, H, D)
     dk_partial = self.rand_bf16(B * PARTIALS, N, H_KV, D)
     dv_partial = self.rand_bf16(B * PARTIALS, N, H_KV, D)
@@ -160,6 +160,32 @@ class TestFusedQKVRoPE(unittest.TestCase):
     dv_ref = dv_partial.float().reshape(B, PARTIALS, N, H_KV, D).sum(1).cast(dtypes.bfloat16).unsqueeze(3)
     ref = Tensor.cat(dq_ref, dk_ref, dv_ref, dim=3).reshape(*dx.shape).realize()
     with Context(DEBUG=0): self.assertTrue(dx.allclose(ref, atol=2e-2, rtol=2e-2).item(), "backward mismatch")
+
+def run_swiglu(test:unittest.TestCase, shape:tuple[int, ...]) -> None:
+  Tensor.manual_seed(0)
+  x = (Tensor.randn(*shape) * 2).cast(dtypes.bfloat16).realize()
+  hidden = x.shape[-1] // 2
+  out, ref = swiglu(x), x[..., :hidden].silu() * x[..., hidden:]
+  Tensor.realize(out, ref)
+  with Context(DEBUG=0): test.assertTrue(out.allclose(ref, atol=2.5e-1, rtol=3e-2).item(), "SwiGLU forward mismatch")
+
+  grad = (Tensor.randn(*out.shape) * 2).cast(dtypes.bfloat16).realize()
+  grad_x, grad_ref = out.gradient(x, gradient=grad)[0], ref.gradient(x, gradient=grad)[0]
+  Tensor.realize(grad_x, grad_ref)
+  test.assertEqual(grad_x.shape, shape)
+  test.assertEqual(grad_x.dtype, dtypes.bfloat16)
+  with Context(DEBUG=0): test.assertTrue(grad_x.allclose(grad_ref, atol=2.5e-1, rtol=3e-2).item(), "SwiGLU backward mismatch")
+
+class TestSwiGLU(unittest.TestCase):
+  def setUp(self):
+    if dtypes.bfloat16 not in Device[Device.DEFAULT].renderer.supported_dtypes(): self.skipTest("need bfloat16")
+
+  def test_simple(self): run_swiglu(self, (2, 32, 64))
+
+  def test_llama_shape(self):
+    if Device.DEFAULT != "AMD" or not Device[Device.DEFAULT].renderer.target.arch.startswith("gfx950"):
+      self.skipTest("only run on real machine for speed")
+    run_swiglu(self, (2, 8192, 28672))
 
 if __name__ == '__main__':
   unittest.main()

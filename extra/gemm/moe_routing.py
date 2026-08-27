@@ -5,7 +5,8 @@ BLOCK_ROW = 256
 
 def _sharded_invalids(shape:tuple[int, ...], dtype, device) -> Tensor:
   if isinstance(device, tuple):
-    return Tensor.invalids(*shape, dtype=dtype, device=device[0]).shard(device, axis=0)
+    per = Tensor.invalids(shape[0]//len(device), *shape[1:], dtype=dtype, device=device)
+    return Tensor(per.uop.unshard(0), device=device)
   return Tensor.invalids(*shape, dtype=dtype, device=device)
 
 def _atomic_add(device:str) -> str:
@@ -52,7 +53,7 @@ def _ggather_bwd(gradient:UOp, kernel:UOp) -> tuple:
     g, m, j, jo, ji = _kv_ranges(Gk, M, Dk, _blk_for(Dk))
     row = idx.index(g, m).cast(dtypes.weakint)
     val = gout.index(g, m, j).load().cast(dtypes.float32)
-    atomic = UOp(Ops.CUSTOM, dtypes.void, (gtab.index(g, row, j), val), arg=atomic_str)
+    atomic = UOp(Ops.CUSTOM, src=(gtab.index(g, row, j), val), arg=(atomic_str, dtypes.void))
     return atomic.end(g, m, jo, ji).sink(arg=KernelInfo(name=f"ggather_bwd_{M}_{Dk}", opts_to_apply=()))
   grad_table = Tensor.custom_kernel(gt, go, Tensor(idx_u, device=dev), fxn=_bwd_kernel)[0]
   return (None, grad_table.cast(table_u.dtype).uop, None)

@@ -82,7 +82,7 @@ class TestVminVmaxProperties(unittest.TestCase):
   def test_vmin_vmax_multiplication_0_inf(self):
     # vmin and vmax for multiplication with a variable
     x = UOp.const(0.0)
-    y = UOp.load(UOp.param(0, dtypes.float, (1,)), UOp.const(0), dtype=dtypes.float)
+    y = UOp.load(UOp.param(0, dtypes.float, (1,)), UOp.const(0))
     uop = x * y
     # TODO: these should be 0, but definitely should not be nan
     self.assertEqual(uop.vmin, -math.inf)
@@ -167,6 +167,10 @@ class TestVminVmaxProperties(unittest.TestCase):
     self.assertEqual(UOp.const(4.5).cast(dtypes.float).cast(dtypes.int)._min_max, (4, 4))
     x = UOp.const(4.5).cast(dtypes.float)
     self.assertIs(x.ne(x.cast(dtypes.int).cast(dtypes.float)).simplify().arg, True)
+
+  def test_vmin_vmax_cast_int_to_float_grid(self):
+    # a cast to float only takes values on the float grid, so its bounds are the source bounds rounded at the destination
+    self.assertEqual(UOp.variable('x', 0, 16777219, dtypes.int).cast(dtypes.float)._min_max, (0.0, 16777220.0))
 
   def test_vmin_vmax_invalid(self):
     i = UOp.invalid()
