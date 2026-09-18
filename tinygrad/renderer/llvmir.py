@@ -60,10 +60,8 @@ def render_wmma_amd(ctx, wmma: UOp, cdna=False, rdna4=False) -> str:
   args = [f"{ldt(w.dtype, w.max_numel())} {ctx[w]}" for w in wmma.src]
   if wmma.arg[1] == dtypes.int8: args = ["i1 true", args[0], "i1 true", args[1], args[2]]  # iu8 flags A/B signed
   if wmma.dtype != dtypes.float: args.append("i1 false") # opsel
-  def _bf16(dt:DType): return dtypes.ushort if dt is dtypes.bfloat16 else dt
-  suffix = f".v{wmma.max_numel()}{dt_map[_bf16(wmma.dtype)]}.v{wmma.src[0].max_numel()}{dt_map[_bf16(wmma.arg[1])]}" if rdna4 else ""
-  # bfloat treated as i16 in LLVM call
-  return f"  {ctx[wmma]} = call {ldt(_bf16(wmma.dtype), wmma.max_numel())} @llvm.amdgcn.wmma.{dt_map[wmma.src[-1].dtype]}.16x16x16." + \
+  suffix = f".v{wmma.max_numel()}{dt_map[wmma.dtype]}.v{wmma.src[0].max_numel()}{dt_map[wmma.arg[1]]}" if rdna4 else ""
+  return f"  {ctx[wmma]} = call {ldt(wmma.dtype, wmma.max_numel())} @llvm.amdgcn.wmma.{dt_map[wmma.src[-1].dtype]}.16x16x16." + \
     f"{dt_map[wmma.arg[1]]}{suffix}(" + ", ".join(args) + ")"
 
 # llvm ops, lop[<dtype>][<op>]
@@ -152,7 +150,7 @@ class LLVMRenderer(Renderer):
 
   extra_matcher = create_non_native_float_pats((dtypes.bfloat16,)) + pm_manual_bf16_cast
   def _render_fn(self, name:str, args:list[tuple[str,UOp]], kernel:list[str], prefix:list[str]|None=None) -> str:
-    # NOTE: CPUAllocator promises 0x20 alignment
+    # NOTE: HostAllocator promises 0x20 alignment
     sargs = ", ".join([f"{ldt(u.dtype, ptr=u.addrspace == AddrSpace.GLOBAL)}{' noalias align 32' if u.addrspace == AddrSpace.GLOBAL else ''} " + \
       name for name,u in args])
     return "\n".join((prefix or []) + [f"define{' ' + self.abi if self.abi else ''} void @{name}({sargs}) #0", "{"] + kernel + ["  ret void\n}"])

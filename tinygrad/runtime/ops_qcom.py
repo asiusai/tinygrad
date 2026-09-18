@@ -1,20 +1,22 @@
 from __future__ import annotations
-import os, ctypes, errno, functools, glob, mmap, struct, array, math, sys, time, weakref, contextlib, select
-assert sys.platform != 'win32'
+import os, ctypes, functools, mmap, struct, array, math, sys, contextlib, glob, select, errno, time
 from dataclasses import dataclass
+assert sys.platform != 'win32'
 from typing import Any
-from tinygrad.device import BufferSpec, Device, TinyELF
-from tinygrad.runtime.support.hcq import HCQBuffer, HWQueue, HCQProgram, HCQCompiled, HCQAllocatorBase, HCQSignal, HCQArgsState, BumpAllocator
+from tinygrad.device import Compiled, BufferStorage, BufferSpec, Buffer, Device, Allocator, TinyELF
+from tinygrad.runtime.support.hcq2 import HWQueue, HCQ_RUNTIME_DEV, encode_submit, ccall, cstruct, patch, unwrap_view, layout_args, pack_args
+from tinygrad.runtime.support.hcq2 import cfield, timeline
 from tinygrad.runtime.support.hcq import FileIOInterface, MMIOInterface
-from tinygrad.runtime.graph.hcq import HCQGraph
-from tinygrad.runtime.support.memory import TLSFAllocator
-from tinygrad.runtime.autogen import kgsl, mesa, msm_drm
+from tinygrad.runtime.autogen import kgsl, mesa, libc, msm_drm
 from tinygrad.renderer.cstyle import QCOMCLRenderer
 from tinygrad.renderer.nir import IR3Renderer
-from tinygrad.helpers import getenv, mv_address, to_mv, round_up, data64_le, ceildiv, prod, cpu_profile, lo32, suppress_finalizing
-from tinygrad.helpers import is_image_shape, next_power2, flatten, PROFILE, IMAGE
+from tinygrad.helpers import getenv, mv_address, round_up, ceildiv, prod, is_image_shape
+from tinygrad.helpers import next_power2, flatten, PROFILE, IMAGE
 from tinygrad.dtype import dtypes, AddrSpace
+from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher
+from tinygrad.engine.realize import get_call_arg_uops, get_call_var_uops
 from tinygrad.runtime.support.system import System
+from tinygrad.runtime.support.memory import TLSFAllocator
 if getenv("IOCTL"): import extra.qcom_gpu_driver.opencl_ioctl  # noqa: F401  # pylint: disable=unused-import
 
 BUFTYPE_BUF, BUFTYPE_TEX, BUFTYPE_IBO = 0, 1, 2
@@ -22,7 +24,7 @@ MSM_WAIT_SLICE_NS = 1_000_000
 
 @functools.cache
 def dcache_flush():
-  from tinygrad.uop.ops import UOp, Ops, KernelInfo
+  from tinygrad.uop.ops import KernelInfo
   from tinygrad.codegen import to_program
   buf, n = UOp.param(0, dtypes.uint8, 1), UOp.param(1, dtypes.int, shape=(), name="n", addrspace=AddrSpace.ALU)
   i = UOp.range(n, 0, dtype=dtypes.int)
@@ -59,202 +61,56 @@ def _qcom_pvtmem_sizes(pvtmem:int, fibers_per_sp:int, num_sp_cores:int) -> tuple
   per_sp_size = round_up(per_fiber_size * fibers_per_sp, 0x1000)
   return per_fiber_size >> 9, per_sp_size >> 12, per_sp_size >> 11, per_sp_size * num_sp_cores
 
-class QCOMSignal(HCQSignal):
-  def __init__(self, *args, **kwargs): super().__init__(*args, **{**kwargs, 'timestamp_divider': 19.2})
-
-  def _sleep(self, time_spent_since_last_sleep_ms:int):
-    # Sleep only for timeline signals. Do it immediately to free cpu.
-    if self.is_timeline and self.owner is not None: self.owner.iface.sleep(time_spent_since_last_sleep_ms)
-
 class QCOMComputeQueue(HWQueue):
-  def __init__(self, dev:QCOMDevice):
-    self.dev = dev
-    super().__init__()
+  dev:QCOMDevice
+  def cmd(self, opcode:int, *vals): self.q(pkt7_hdr(opcode, sum(x.dtype.itemsize // 4 if isinstance(x, UOp) else 1 for x in vals)), *vals)
 
-  @suppress_finalizing
-  def __del__(self):
-    if self.binded_device is not None: self.binded_device.allocator.free(self.hw_page, self.hw_page.size, BufferSpec(cpu_access=True, nolru=True))
-
-  def cmd(self, opcode: int, *vals: int): self.q(pkt7_hdr(opcode, len(vals)), *vals)
-
-  def reg(self, reg: int, *vals: int): self.q(pkt4_hdr(reg, len(vals)), *vals)
+  def reg(self, reg:int, *vals): self.q(pkt4_hdr(reg, sum(x.dtype.itemsize // 4 if isinstance(x, UOp) else 1 for x in vals)), *vals)
 
   def _cache_flush(self, write_back=True, invalidate=False, sync=True, memsync=False):
     # TODO: 7xx support.
-    if write_back:
-      event = mesa.CACHE_FLUSH_TS | (mesa.CP_EVENT_WRITE_0_IRQ if getattr(self.dev.iface, "event_write_irq", False) else 0)
-      self.cmd(mesa.CP_EVENT_WRITE, event, *data64_le(self.dev.dummy_addr), 0) # dirty cache write-back.
+    if write_back: # dirty cache write-back, into the device's dummy buffer
+      dummy = UOp.placeholder((0x1000,), dtypes.uint8, 0, device=self.devs, tag="dummy")
+      event = mesa.CACHE_FLUSH_TS | (mesa.CP_EVENT_WRITE_0_IRQ if isinstance(self.dev.iface, MSMIface) else 0)
+      self.cmd(mesa.CP_EVENT_WRITE, event, dummy.getaddr(self.devs), 0)
     if invalidate: self.cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_INVALIDATE) # invalidate cache lines (following reads from RAM).
     if memsync: self.cmd(mesa.CP_WAIT_MEM_WRITES)
     if sync: self.cmd(mesa.CP_WAIT_FOR_IDLE)
 
-  def memory_barrier(self):
-    self._cache_flush(write_back=True, invalidate=True, sync=True, memsync=True)
-    return self
+  def memory_barrier(self): self._cache_flush(write_back=True, invalidate=True, sync=True, memsync=True)
 
-  def signal(self, signal:QCOMSignal, value=0):
+  def signal(self, signal:UOp, value:UOp):
     self.cmd(mesa.CP_WAIT_FOR_IDLE)
     if self.dev.gpu_id[:2] < (7, 3):
-      event = qreg.cp_event_write_0(event=mesa.CACHE_FLUSH_TS) | \
-              (mesa.CP_EVENT_WRITE_0_IRQ if getattr(self.dev.iface, "event_write_irq", False) else 0)
-      self.cmd(mesa.CP_EVENT_WRITE, event, *data64_le(signal.value_addr), lo32(value))
+      event = qreg.cp_event_write_0(event=mesa.CACHE_FLUSH_TS) | (mesa.CP_EVENT_WRITE_0_IRQ if isinstance(self.dev.iface, MSMIface) else 0)
+      self.cmd(mesa.CP_EVENT_WRITE, event, signal.getaddr(self.devs), value.cast(dtypes.uint32))
       self._cache_flush(write_back=True, invalidate=False, sync=False, memsync=False)
     else:
       # TODO: support devices starting with 8 Gen 1. Also, 700th series have convenient CP_GLOBAL_TIMESTAMP and CP_LOCAL_TIMESTAMP
       raise RuntimeError('CP_EVENT_WRITE7 is not supported')
-    return self
 
-  def timestamp(self, signal:QCOMSignal):
+  def timestamp(self, signal:UOp):
     self.cmd(mesa.CP_WAIT_FOR_IDLE)
-    self.cmd(mesa.CP_REG_TO_MEM, qreg.cp_reg_to_mem_0(reg=mesa.REG_A6XX_CP_ALWAYS_ON_COUNTER, cnt=2, _64b=True),*data64_le(signal.timestamp_addr))
-    return self
+    self.cmd(mesa.CP_REG_TO_MEM, qreg.cp_reg_to_mem_0(reg=mesa.REG_A6XX_CP_ALWAYS_ON_COUNTER, cnt=2, _64b=True), signal.getaddr(self.devs))
 
-  def wait(self, signal:QCOMSignal, value=0):
-    self.cmd(mesa.CP_WAIT_REG_MEM, qreg.cp_wait_reg_mem_0(function=mesa.WRITE_GE, poll=mesa.POLL_MEMORY),*data64_le(signal.value_addr),
-             qreg.cp_wait_reg_mem_3(ref=value&0xFFFFFFFF), qreg.cp_wait_reg_mem_4(mask=0xFFFFFFFF), qreg.cp_wait_reg_mem_5(delay_loop_cycles=32))
-    return self
+  def wait(self, signal:UOp, value:UOp):
+    self.cmd(mesa.CP_WAIT_REG_MEM, qreg.cp_wait_reg_mem_0(function=mesa.WRITE_GE, poll=mesa.POLL_MEMORY), signal.getaddr(self.devs),
+             value.cast(dtypes.uint32), qreg.cp_wait_reg_mem_4(mask=0xFFFFFFFF), qreg.cp_wait_reg_mem_5(delay_loop_cycles=32))
 
-  def _build_gpu_command(self, dev:QCOMDevice, hw_page:HCQBuffer|None=None) -> HCQBuffer:
-    if hw_page is None:
-      hw_page_addr = dev.cmd_buf_allocator.alloc(len(self._q) * 4)
-      hw_page = dev.cmd_buf.offset(offset=int(hw_page_addr - dev.cmd_buf.va_addr), size=len(self._q) * 4)
-    hw_page.cpu_view().view(fmt='I')[:] = array.array('I', self._q)
-    return hw_page
-
-  def bind(self, dev:QCOMDevice):
-    self.binded_device = dev
-    self.hw_page = self._build_gpu_command(dev, dev.allocator.alloc(len(self._q) * 4, BufferSpec(cpu_access=True, nolru=True)))
-    # From now on, the queue is on the device for faster submission.
-    self._q = self.hw_page.cpu_view().view(fmt='I')
-
-  def _submit(self, dev:QCOMDevice):
-    command = self.hw_page if self.binded_device == dev else self._build_gpu_command(dev)
-    dev.last_cmd = dev.iface.submit(command, len(self._q) * 4)
-
-  def exec(self, prg:QCOMProgram, args_state:QCOMArgsState, global_size, local_size):
-    self.bind_args_state(args_state)
-
-    def cast_int(x, ceil=False): return (math.ceil(x) if ceil else int(x)) if isinstance(x, float) else x
-    global_size_mp = [cast_int(g*l) for g,l in zip(global_size, local_size)]
-
-    threadsize = mesa.THREAD128 if prg.double_threadsize else mesa.THREAD64
-    supports_double_threadsize = self.dev.dev_info.a6xx.supports_double_threadsize
-    wge_threadsize = threadsize if supports_double_threadsize else mesa.THREAD128
-    const_ram_mode = mesa.CONSTLEN_512 if prg.constlen > 256 else \
-                     mesa.CONSTLEN_256 if prg.constlen > 192 else \
-                     mesa.CONSTLEN_192 if prg.constlen > 128 else mesa.CONSTLEN_128
-
-    self.cmd(mesa.CP_SET_MARKER, qreg.a6xx_cp_set_marker_0(mode=mesa.RM6_COMPUTE))
-    self.reg(mesa.REG_A6XX_SP_UPDATE_CNTL, qreg.a6xx_sp_update_cntl(vs_state=True, hs_state=True, ds_state=True, gs_state=True,
-                                                                   fs_state=True, cs_state=True, cs_uav=True, gfx_uav=True))
-    self.reg(mesa.REG_A6XX_SP_CS_TSIZE, qreg.a6xx_sp_cs_tsize(0x80)) # is this right? mesa uses 1
-    self.reg(mesa.REG_A6XX_SP_CS_USIZE, qreg.a6xx_sp_cs_usize(0x40)) # mesa also uses 1
-    self.reg(mesa.REG_A6XX_SP_MODE_CNTL, qreg.a6xx_sp_mode_cntl(isammode=mesa.ISAMMODE_GL if prg.NIR else mesa.ISAMMODE_CL,
-                                                                constant_demotion_enable=prg.NIR))
-    self.reg(mesa.REG_A6XX_SP_PERFCTR_SHADER_MASK, qreg.a6xx_sp_perfctr_shader_mask(cs=True))
-    self.reg(mesa.REG_A6XX_TPL1_MODE_CNTL, qreg.a6xx_tpl1_mode_cntl(isammode=mesa.ISAMMODE_GL if prg.NIR else mesa.ISAMMODE_CL))
-    self.reg(mesa.REG_A6XX_TPL1_DBG_ECO_CNTL, 0)
-    self.cmd(mesa.CP_WAIT_FOR_IDLE)
-
-    self.reg(mesa.REG_A6XX_SP_CS_NDRANGE_0,
-             qreg.a6xx_sp_cs_ndrange_0(kerneldim=3, localsizex=local_size[0] - 1, localsizey=local_size[1] - 1, localsizez=local_size[2] - 1),
-             global_size_mp[0], 0, global_size_mp[1], 0, global_size_mp[2], 0, 0xccc0cf,
-             0xfc | qreg.a6xx_sp_cs_wge_cntl(threadsize=wge_threadsize),
-             cast_int(global_size[0], ceil=True), cast_int(global_size[1], ceil=True), cast_int(global_size[2], ceil=True))
-
-    self.reg(mesa.REG_A6XX_SP_CS_CNTL_0,
-             qreg.a6xx_sp_cs_cntl_0(threadsize=threadsize, halfregfootprint=prg.hregs, fullregfootprint=prg.fregs,
-                                    branchstack=prg.brnchstck, earlypreamble=prg.early_preamble, mergedregs=prg.mergedregs),
-             qreg.a6xx_sp_cs_cntl_1(constantrammode=const_ram_mode, shared_size=prg.shared_size),
-             0, prg.prg_offset, *data64_le(prg.lib_gpu.va_addr),
-             qreg.a6xx_sp_cs_pvt_mem_param(memsizeperitem=prg.pvtmem_size_per_item), *data64_le(prg.dev._stack.va_addr),
-             qreg.a6xx_sp_cs_pvt_mem_size(totalpvtmemsize=prg.pvtmem_size_total,
-                                          perwavememlayout=prg.pvtmem_per_wave))
-    if self.dev.dev_info.a6xx.has_lpac:
-      self.reg(mesa.REG_A6XX_HLSQ_CS_CTRL_REG1,
-               qreg.a6xx_hlsq_cs_ctrl_reg1(constantrammode=const_ram_mode, shared_size=prg.shared_size))
-    if not supports_double_threadsize:
-      self.reg(mesa.REG_A6XX_SP_PS_WAVE_CNTL, qreg.a6xx_sp_ps_wave_cntl(threadsize=threadsize))
-
-    if prg.NIR and prg.wgsz != 0xfc:
-      args_state.buf.cpu_view().view(offset=prg.wgsz * 4, size=12, fmt='B')[:] = struct.pack("III", *local_size)
-    self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_CONSTANTS, state_src=mesa.SS6_INDIRECT,
-                                                             state_block=mesa.SB6_CS_SHADER, num_unit=1024 // 4),
-             *data64_le(args_state.buf.va_addr))
-    self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_SHADER, state_src=mesa.SS6_INDIRECT,
-                                                             state_block=mesa.SB6_CS_SHADER, num_unit=ceildiv(prg.image_size, 128)),
-             *data64_le(prg.lib_gpu.va_addr))
-
-    self.reg(mesa.REG_A6XX_SP_REG_PROG_ID_0, 0xfcfcfcfc, 0xfcfcfcfc, 0xfcfcfcfc, 0xfc,
-             qreg.a6xx_sp_cs_const_config(constlen=ceildiv(prg.constlen, 4), enabled=True))
-
-    self.reg(mesa.REG_A6XX_SP_CS_PVT_MEM_STACK_OFFSET, qreg.a6xx_sp_cs_pvt_mem_stack_offset(prg.hw_stack_offset))
-    # image_size is in bytes, but INSTR_SIZE is measured in units of instruction groups (16 instructions, 8 bytes each)
-    # https://elixir.bootlin.com/mesa/mesa-26.1.5/source/src/freedreno/ir3/ir3_shader.h#L719-L723
-    self.reg(mesa.REG_A6XX_SP_CS_INSTR_SIZE, qreg.a6xx_sp_cs_instr_size(ceildiv(prg.image_size, 128)))
-
-    if prg.samp_cnt > 0:
-      self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_SHADER, state_src=mesa.SS6_INDIRECT,
-                                                               state_block=mesa.SB6_CS_TEX, num_unit=args_state.prg.samp_cnt),
-               *data64_le(args_state.buf.va_addr + args_state.prg.samp_off))
-      self.reg(mesa.REG_A6XX_SP_CS_SAMPLER_BASE, *data64_le(args_state.buf.va_addr + args_state.prg.samp_off))
-      self.reg(mesa.REG_A6XX_TPL1_CS_BORDER_COLOR_BASE, *data64_le(prg.dev.border_color_buf.va_addr))
-
-    if prg.tex_cnt > 0:
-      self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_CONSTANTS, state_src=mesa.SS6_INDIRECT,
-                                                               state_block=mesa.SB6_CS_TEX, num_unit=min(16, args_state.prg.tex_cnt)),
-               *data64_le(args_state.buf.va_addr + args_state.prg.tex_off))
-      self.reg(mesa.REG_A6XX_SP_CS_TEXMEMOBJ_BASE, *data64_le(args_state.buf.va_addr + args_state.prg.tex_off))
-
-    if prg.ibo_cnt > 0:
-      self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST6_UAV, state_src=mesa.SS6_INDIRECT,
-                                                               state_block=mesa.SB6_CS_SHADER, num_unit=args_state.prg.ibo_cnt),
-               *data64_le(args_state.buf.va_addr + args_state.prg.ibo_off))
-      self.reg(mesa.REG_A6XX_SP_CS_UAV_BASE, *data64_le(args_state.buf.va_addr + args_state.prg.ibo_off))
-
-    self.reg(mesa.REG_A6XX_SP_CS_CONFIG,
-             qreg.a6xx_sp_cs_config(enabled=True, nsamp=args_state.prg.samp_cnt, ntex=args_state.prg.tex_cnt, nuav=args_state.prg.ibo_cnt))
-
-    if prg.NIR:
-      self.reg(mesa.REG_A6XX_SP_CS_CONST_CONFIG_0,
-               qreg.a6xx_sp_cs_const_config_0(wgidconstid=prg.wgid, wgsizeconstid=prg.wgsz, wgoffsetconstid=0xfc, localidregid=prg.lid),
-               qreg.a6xx_sp_cs_wge_cntl(linearlocalidregid=0xfc, threadsize=wge_threadsize))
-      if self.dev.dev_info.a6xx.has_lpac:
-        self.reg(mesa.REG_A6XX_SP_CS_WIE_CNTL_0,
-                 qreg.a6xx_sp_cs_wie_cntl_0(wgidconstid=prg.wgid, wgsizeconstid=prg.wgsz,
-                                            wgoffsetconstid=0xfc, localidregid=prg.lid),
-                 qreg.a6xx_sp_cs_wie_cntl_1(linearlocalidregid=0xfc, threadsize=threadsize))
-      self.cmd(mesa.CP_EXEC_CS, 0,
-               qreg.cp_exec_cs_1(ngroups_x=cast_int(global_size[0], ceil=True)),
-               qreg.cp_exec_cs_2(ngroups_y=cast_int(global_size[1], ceil=True)),
-               qreg.cp_exec_cs_3(_ngroups_z=cast_int(global_size[2], ceil=True)))
-    else: self.cmd(mesa.CP_RUN_OPENCL, 0)
-
-    self._cache_flush(write_back=True, invalidate=False, sync=False, memsync=False)
-    return self
-
-class QCOMArgsState(HCQArgsState):
-  def __init__(self, buf:HCQBuffer, prg:QCOMProgram, bufs:tuple[HCQBuffer, ...], vals:tuple[int, ...]=()):
-    super().__init__(buf, prg, bufs, vals=vals)
-    self.buf.cpu_view().view(size=prg.kernargs_alloc_size, fmt='B')[:] = bytes(prg.kernargs_alloc_size)
-
-    ubos = [bufs[slot] for _,slot,_,shape in prg.signature if slot < len(bufs) and not is_image_shape(shape)]
-    uavs = [(dt,shape,bufs[slot]) for _,slot,dt,shape in prg.signature if slot < len(bufs) and is_image_shape(shape)]
+  def kernargs(self, call:UOp, prg:UOp, data:QCOMProgramData) -> UOp:
+    bufs, vals = get_call_arg_uops(call), get_call_var_uops(call, prg)
+    ubos = [bufs[slot] for _,slot,_,shape in data.signature if slot < len(bufs) and not is_image_shape(shape)]
+    uavs = [(dt,shape,bufs[slot]) for _,slot,dt,shape in data.signature if slot < len(bufs) and is_image_shape(shape)]
     # NIR can reorder images to different texture slots
-    ibos, texs = uavs[:prg.ibo_cnt], [uavs[prg.ibo_cnt + (prg.tex_to_image[i] if prg.NIR else i)] for i in range(prg.tex_cnt)]
-    for cnst_val,cnst_off,cnst_sz in prg.consts_info:
-      self.buf.cpu_view().view(offset=cnst_off, size=cnst_sz, fmt='B')[:] = cnst_val.to_bytes(cnst_sz, byteorder='little')
+    ibos, texs = uavs[:data.ibo_cnt], [uavs[data.ibo_cnt + (data.tex_to_image[i] if data.NIR else i)] for i in range(data.tex_cnt)]
 
-    if prg.samp_cnt > 0:
-      self.buf.cpu_view().view(offset=prg.samp_off, size=len(prg.samplers) * 4, fmt='I')[:] = array.array('I', prg.samplers)
-    if prg.NIR:
-      self.bind_sints_to_buf(*[b.va_addr for b in ubos], buf=self.buf, fmt='Q', offset=prg.buf_off)
-      for v,(o,dt) in zip(vals, TinyELF.iter_sig(prg.signature[len(bufs):], len(ubos)*8)):
-        self.bind_sints_to_buf(v, buf=self.buf, fmt=dt.fmt, offset=prg.buf_off + o)
-    else:
-      for i, b in enumerate(ubos): self.bind_sints_to_buf(b.va_addr, buf=self.buf, fmt='Q', offset=prg.buf_offs[i])
-      for i,(v,(_,_,dt,_)) in enumerate(zip(vals, prg.signature[len(bufs):])):
-        self.bind_sints_to_buf(v, buf=self.buf, fmt=dt.fmt, offset=prg.buf_offs[i+len(ubos)])
+    args = [(off, UOp.const(val, dtypes.uint32 if sz == 4 else dtypes.uint16)) for val,off,sz in data.consts_info]
+    args += layout_args(data.samplers, data.samp_off)
+    vals = [v.ccast(dt) for v,(_,_,dt,_) in zip(vals, data.signature[len(bufs):])]
+    if data.NIR:
+      args += layout_args([b.getaddr(self.devs) for b in ubos] + vals, data.buf_off)
+      if data.wgsz != 0xfc: args += layout_args(list(prg.arg.local_size), data.wgsz * 4)
+    else: args += list(zip(data.buf_offs, [b.getaddr(self.devs) for b in ubos] + vals))
 
     def _tex(b, ibo=False):
       imgdt, shape, buf = b
@@ -262,15 +118,138 @@ class QCOMArgsState(HCQArgsState):
       fmt = mesa.FMT6_32_32_32_32_FLOAT if imgdt.itemsize == 4 else mesa.FMT6_16_16_16_16_FLOAT
       return [qreg.a6xx_tex_const_0(fmt=fmt) if ibo else qreg.a6xx_tex_const_0(0x8, swiz_x=0, swiz_y=1, swiz_z=2, swiz_w=3, fmt=fmt),
               qreg.a6xx_tex_const_1(width=shape[1], height=shape[0]),
-              qreg.a6xx_tex_const_2(type=mesa.A6XX_TEX_2D, pitch=pitch, pitchalign=ctz(pitch)-6), 0, *data64_le(buf.va_addr),
+              qreg.a6xx_tex_const_2(type=mesa.A6XX_TEX_2D, pitch=pitch, pitchalign=ctz(pitch)-6), 0, buf.getaddr(self.devs),
               qreg.a6xx_tex_const_6(plane_pitch=0x400000), qreg.a6xx_tex_const_7(13), 0, 0, 0, 0, 0, 0, 0, 0]
+    args += layout_args(flatten(map(_tex, texs)), data.tex_off) + layout_args(flatten(map(functools.partial(_tex, ibo=True), ibos)), data.ibo_off)
+    return UOp(Ops.LINEAR, src=tuple(pack_args(args, data.kernargs_alloc_size)), arg="kernargs")
 
-    self.bind_sints_to_buf(*flatten(map(_tex, texs)), buf=self.buf, fmt='I', offset=prg.tex_off)
-    self.bind_sints_to_buf(*flatten(map(functools.partial(_tex, ibo=True), ibos)), buf=self.buf, fmt='I', offset=prg.ibo_off)
+  def exec(self, call:UOp, prg:UOp):
+    data, lib = qcom_build_program(self.dev, prg, self.devs)
+    global_size, local_size = prg.arg.global_size, prg.arg.local_size
+    if data.max_threads < prod(local_size): raise RuntimeError("Too many resources requested for launch")
+    if any(g*l>mx for g,l,mx in zip(global_size, local_size, [65536, 65536, 65536])) and any(l>mx for l,mx in zip(local_size, [1024, 1024, 1024])):
+      raise RuntimeError(f"Invalid global/local dims {global_size=}, {local_size=}")
 
-class QCOMProgram(HCQProgram['QCOMDevice']):
-  def __init__(self, dev: QCOMDevice, obj: TinyELF):
-    self.dev: QCOMDevice = dev
+    def cast_int(x, ceil=False): return (math.ceil(x) if ceil else int(x)) if isinstance(x, float) else x
+    global_size_mp = [cast_int(g*l) for g,l in zip(global_size, local_size)]
+
+    args_addr, lib_addr = self.kernargs(call, prg, data).getaddr(self.devs), lib.getaddr(self.devs)
+    stack_addr = UOp.placeholder((data.stack_size,), dtypes.uint8, 0, device=self.devs).rtag("stack").getaddr(self.devs)
+
+    threadsize = mesa.THREAD128 if data.double_threadsize else mesa.THREAD64
+    supports_double_threadsize = self.dev.dev_info.a6xx.supports_double_threadsize
+    wge_threadsize = threadsize if supports_double_threadsize else mesa.THREAD128
+    const_ram_mode = mesa.CONSTLEN_512 if data.constlen > 256 else \
+                     mesa.CONSTLEN_256 if data.constlen > 192 else \
+                     mesa.CONSTLEN_192 if data.constlen > 128 else mesa.CONSTLEN_128
+
+    self.cmd(mesa.CP_SET_MARKER, qreg.a6xx_cp_set_marker_0(mode=mesa.RM6_COMPUTE))
+    self.reg(mesa.REG_A6XX_SP_UPDATE_CNTL, qreg.a6xx_sp_update_cntl(vs_state=True, hs_state=True, ds_state=True, gs_state=True,
+                                                                   fs_state=True, cs_state=True, cs_uav=True, gfx_uav=True))
+    self.reg(mesa.REG_A6XX_SP_CS_TSIZE, qreg.a6xx_sp_cs_tsize(0x80)) # is this right? mesa uses 1
+    self.reg(mesa.REG_A6XX_SP_CS_USIZE, qreg.a6xx_sp_cs_usize(0x40)) # mesa also uses 1
+    self.reg(mesa.REG_A6XX_SP_MODE_CNTL, qreg.a6xx_sp_mode_cntl(isammode=mesa.ISAMMODE_GL if data.NIR else mesa.ISAMMODE_CL,
+                                                                constant_demotion_enable=data.NIR))
+    self.reg(mesa.REG_A6XX_SP_PERFCTR_SHADER_MASK, qreg.a6xx_sp_perfctr_shader_mask(cs=True))
+    self.reg(mesa.REG_A6XX_TPL1_MODE_CNTL, qreg.a6xx_tpl1_mode_cntl(isammode=mesa.ISAMMODE_GL if data.NIR else mesa.ISAMMODE_CL))
+    self.reg(mesa.REG_A6XX_TPL1_DBG_ECO_CNTL, 0)
+    self.cmd(mesa.CP_WAIT_FOR_IDLE)
+
+    self.reg(mesa.REG_A6XX_SP_CS_NDRANGE_0,
+             qreg.a6xx_sp_cs_ndrange_0(kerneldim=3, localsizex=local_size[0] - 1, localsizey=local_size[1] - 1, localsizez=local_size[2] - 1),
+             global_size_mp[0], 0, global_size_mp[1], 0, global_size_mp[2], 0, 0xccc0cf, 0xfc | qreg.a6xx_sp_cs_wge_cntl(threadsize=wge_threadsize),
+             cast_int(global_size[0], ceil=True), cast_int(global_size[1], ceil=True), cast_int(global_size[2], ceil=True))
+
+    self.reg(mesa.REG_A6XX_SP_CS_CNTL_0,
+             qreg.a6xx_sp_cs_cntl_0(threadsize=threadsize, halfregfootprint=data.hregs, fullregfootprint=data.fregs,
+                                  branchstack=data.brnchstck, earlypreamble=data.early_preamble, mergedregs=data.mergedregs),
+             qreg.a6xx_sp_cs_cntl_1(constantrammode=const_ram_mode, shared_size=data.shared_size),
+             0, data.prg_offset, lib_addr,
+             qreg.a6xx_sp_cs_pvt_mem_param(memsizeperitem=data.pvtmem_size_per_item), stack_addr,
+             qreg.a6xx_sp_cs_pvt_mem_size(totalpvtmemsize=data.pvtmem_size_total, perwavememlayout=data.pvtmem_per_wave))
+    if self.dev.dev_info.a6xx.has_lpac:
+      self.reg(mesa.REG_A6XX_HLSQ_CS_CTRL_REG1,
+               qreg.a6xx_hlsq_cs_ctrl_reg1(constantrammode=const_ram_mode, shared_size=data.shared_size))
+    if not supports_double_threadsize:
+      self.reg(mesa.REG_A6XX_SP_PS_WAVE_CNTL, qreg.a6xx_sp_ps_wave_cntl(threadsize=threadsize))
+
+    # the kernargs sit in the cmdbuf, so the const upload is sized to them (in vec4s) rather than to the whole constlen: it must not read past
+    self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_CONSTANTS, state_src=mesa.SS6_INDIRECT,
+                                                             state_block=mesa.SB6_CS_SHADER, num_unit=data.kernargs_alloc_size // 16), args_addr)
+    self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_SHADER, state_src=mesa.SS6_INDIRECT,
+                                                             state_block=mesa.SB6_CS_SHADER, num_unit=ceildiv(data.image_size, 128)), lib_addr)
+
+    self.reg(mesa.REG_A6XX_SP_REG_PROG_ID_0, 0xfcfcfcfc, 0xfcfcfcfc, 0xfcfcfcfc, 0xfc,
+             qreg.a6xx_sp_cs_const_config(constlen=ceildiv(data.constlen, 4), enabled=True))
+
+    self.reg(mesa.REG_A6XX_SP_CS_PVT_MEM_STACK_OFFSET, qreg.a6xx_sp_cs_pvt_mem_stack_offset(data.hw_stack_offset))
+    # image_size is in bytes, but INSTR_SIZE is measured in units of instruction groups (16 instructions, 8 bytes each)
+    # https://elixir.bootlin.com/mesa/mesa-26.1.5/source/src/freedreno/ir3/ir3_shader.h#L719-L723
+    self.reg(mesa.REG_A6XX_SP_CS_INSTR_SIZE, qreg.a6xx_sp_cs_instr_size(ceildiv(data.image_size, 128)))
+
+    if data.samp_cnt > 0:
+      self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_SHADER, state_src=mesa.SS6_INDIRECT,
+                                                               state_block=mesa.SB6_CS_TEX, num_unit=data.samp_cnt), args_addr + data.samp_off)
+      self.reg(mesa.REG_A6XX_SP_CS_SAMPLER_BASE, args_addr + data.samp_off)
+      self.reg(mesa.REG_A6XX_TPL1_CS_BORDER_COLOR_BASE,
+               UOp.placeholder((0x1000,), dtypes.uint8, 0, device=self.devs, tag="border_color").getaddr(self.devs))
+
+    if data.tex_cnt > 0:
+      self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_CONSTANTS, state_src=mesa.SS6_INDIRECT,
+                                                               state_block=mesa.SB6_CS_TEX, num_unit=min(16, data.tex_cnt)), args_addr + data.tex_off)
+      self.reg(mesa.REG_A6XX_SP_CS_TEXMEMOBJ_BASE, args_addr + data.tex_off)
+
+    if data.ibo_cnt > 0:
+      self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST6_UAV, state_src=mesa.SS6_INDIRECT,
+                                                               state_block=mesa.SB6_CS_SHADER, num_unit=data.ibo_cnt), args_addr + data.ibo_off)
+      self.reg(mesa.REG_A6XX_SP_CS_UAV_BASE, args_addr + data.ibo_off)
+
+    self.reg(mesa.REG_A6XX_SP_CS_CONFIG, qreg.a6xx_sp_cs_config(enabled=True, nsamp=data.samp_cnt, ntex=data.tex_cnt, nuav=data.ibo_cnt))
+
+    if data.NIR:
+      self.reg(mesa.REG_A6XX_SP_CS_CONST_CONFIG_0,
+               qreg.a6xx_sp_cs_const_config_0(wgidconstid=data.wgid, wgsizeconstid=data.wgsz, wgoffsetconstid=0xfc, localidregid=data.lid),
+               qreg.a6xx_sp_cs_wge_cntl(linearlocalidregid=0xfc, threadsize=wge_threadsize))
+      if self.dev.dev_info.a6xx.has_lpac:
+        self.reg(mesa.REG_A6XX_SP_CS_WIE_CNTL_0,
+                 qreg.a6xx_sp_cs_wie_cntl_0(wgidconstid=data.wgid, wgsizeconstid=data.wgsz, wgoffsetconstid=0xfc, localidregid=data.lid),
+                 qreg.a6xx_sp_cs_wie_cntl_1(linearlocalidregid=0xfc, threadsize=threadsize))
+      self.cmd(mesa.CP_EXEC_CS, 0,
+               qreg.cp_exec_cs_1(ngroups_x=global_size[0]), qreg.cp_exec_cs_2(ngroups_y=global_size[1]), qreg.cp_exec_cs_3(_ngroups_z=global_size[2]))
+    else: self.cmd(mesa.CP_RUN_OPENCL, 0)
+
+    self._cache_flush(write_back=True, invalidate=False, sync=False, memsync=False)
+
+  def submit(self, cmdbuf:UOp) -> UOp:
+    ib, ib_off = unwrap_view(cmdbuf)
+    if isinstance(self.dev.iface, MSMIface):
+      fd, queueid, flags = [UOp.variable(n, 0, 2**31 - 1, dtypes.int32, param=True) for n in ("msm_fd", "msm_queue", "msm_flags")]
+      cmd = cstruct(msm_drm.struct_drm_msm_gem_submit_cmd, type=msm_drm.MSM_SUBMIT_CMD_BUF,
+                    size=cmdbuf.max_numel(), iova=ib.getaddr(self.devs) + ib_off)
+      req = cstruct(msm_drm.struct_drm_msm_gem_submit, flags=flags, nr_cmds=1, cmds=cmd.getaddr(HCQ_RUNTIME_DEV.value), queueid=queueid)
+      # Bound independent schedules in flight; the graph's own fence protects its reusable command buffers.
+      tl = timeline(self.devs)
+      target = tl.after(cmdbuf).index(1).load()
+      done = tl.after(target, loop:=UOp.loop(next(UOp.unique_num))).index(0).load()
+      ready = done.end(loop, done + MSMIface.max_inflight < target)
+      idir, base, nr, struct_t = msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT.args
+      ioctl_cmd = (idir << 30) | (ctypes.sizeof(struct_t) << 16) | (base << 8) | nr
+      ret = UOp.placeholder((1,), dtypes.int32, device=self.devs, volatile=True, tag="submit_ret")
+      submitted = ret.index(0).store(ccall(libc.dll.ioctl, fd, UOp.const(ioctl_cmd, dtypes.uint32), req.after(ready).index(0)))
+      fence = UOp.placeholder((1,), dtypes.uint32, 0, device=self.devs, volatile=True, tag="msm_fence")
+      return fence.index(0).store(cfield(req.after(submitted), msm_drm.struct_drm_msm_gem_submit, "fence").load())
+    fd, ctxid = [UOp.variable(n, 0, 2**31 - 1, dtypes.int32, param=True) for n in ("kgsl_fd", "kgsl_ctx")]
+    obj = cstruct(kgsl.struct_kgsl_command_object, gpuaddr=ib.getaddr(self.devs) + ib_off, size=cmdbuf.max_numel(), flags=kgsl.KGSL_CMDLIST_IB)
+    req = cstruct(kgsl.struct_kgsl_gpu_command, cmdlist=obj.getaddr(HCQ_RUNTIME_DEV.value), cmdsize=ctypes.sizeof(kgsl.struct_kgsl_command_object),
+                  numcmds=1, context_id=ctxid)
+    ret = UOp.placeholder((1,), dtypes.int32, device=self.devs, volatile=True, tag="submit_ret")
+
+    idir, base, nr, struct_t = kgsl.IOCTL_KGSL_GPU_COMMAND.args
+    ioctl_cmd = (idir << 30) | (ctypes.sizeof(struct_t) << 16) | (base << 8) | nr
+    return ret.index(0).store(ccall(libc.dll.ioctl, fd, UOp.const(ioctl_cmd, dtypes.uint32), req.after(cmdbuf).index(0)))
+
+class QCOMProgramData:
+  def __init__(self, dev:QCOMDevice, obj:TinyELF):
     self.signature, self.name, self.NIR = obj.signature, obj.name, isinstance(dev.renderer, IR3Renderer)
 
     if self.NIR:
@@ -300,25 +279,11 @@ class QCOMProgram(HCQProgram['QCOMDevice']):
       self.constlen, self.pvtmem_per_wave = 256, False
       self.double_threadsize = self.early_preamble = self.mergedregs = False
 
-    self.lib_gpu: HCQBuffer = self.dev.allocator.alloc(self.image_size, buf_spec:=BufferSpec(cpu_access=True, nolru=True))
-    self.lib_gpu.cpu_view().view(size=self.image_size, fmt='B')[:] = self.image
-
-    self.pvtmem_size_per_item, self.pvtmem_size_total, self.hw_stack_offset, stack_size = \
-      _qcom_pvtmem_sizes(self.pvtmem, self.dev.dev_info.fibers_per_sp, self.dev.dev_info.num_sp_cores)
+    self.pvtmem_size_per_item, self.pvtmem_size_total, self.hw_stack_offset, self.stack_size = \
+      _qcom_pvtmem_sizes(self.pvtmem, dev.dev_info.fibers_per_sp, dev.dev_info.num_sp_cores)
     self.shared_size: int = max(1, (self.shmem - 1) // 1024)
     self.max_threads = min(1024, ((384 * 32) // (max(1, (self.fregs + round_up(self.hregs, 2) // 2)) * 128)) * 128)
-    dev._ensure_stack_size(stack_size)
-
-    kernargs_alloc_size = round_up(2048 + (self.tex_cnt + self.ibo_cnt) * 0x40 + len(self.samplers) * 4, 0x100)
-    super().__init__(QCOMArgsState, self.dev, obj, kernargs_alloc_size=kernargs_alloc_size)
-    weakref.finalize(self, self._fini, self.dev, self.lib_gpu, buf_spec)
-
-  def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1),
-               vals:tuple[int|None, ...]=(), wait=False, **kw):
-    if self.max_threads < prod(local_size): raise RuntimeError("Too many resources requested for launch")
-    if any(g*l>mx for g,l,mx in zip(global_size, local_size, [65536, 65536, 65536])) and any(l>mx for l,mx in zip(local_size, [1024, 1024, 1024])):
-      raise RuntimeError(f"Invalid global/local dims {global_size=}, {local_size=}")
-    return super().__call__(*bufs, global_size=global_size, local_size=local_size, vals=vals, wait=wait)
+    self.kernargs_alloc_size = round_up(2048 + (self.tex_cnt + self.ibo_cnt) * 0x40 + len(self.samplers) * 4, 0x100)
 
   def _parse_lib(self, lib):
     # Extract image binary
@@ -366,21 +331,23 @@ class QCOMProgram(HCQProgram['QCOMDevice']):
     reg_desc_off = _read_lib(lib, 0x34)
     self.fregs, self.hregs = _read_lib(lib, reg_desc_off + 0x14), _read_lib(lib, reg_desc_off + 0x18)
 
-class QCOMAllocator(HCQAllocatorBase):
-  def _alloc(self, size:int, opts:BufferSpec) -> HCQBuffer:
-    if opts.external_ptr is not None: return self.dev.iface.map(opts.external_ptr, size)
-    return self.dev.iface.alloc(size, uncached=opts.uncached)
+_qcom_program_cache:dict[tuple[bytes, tuple[str, ...]], tuple[QCOMProgramData, UOp]] = {}
+def qcom_build_program(dev:QCOMDevice, prg:UOp, devs:tuple[str, ...]) -> tuple[QCOMProgramData, UOp]:
+  if (cached:=_qcom_program_cache.get(key:=(prg.src[3].arg, devs))) is None:
+    data = QCOMProgramData(dev, prg.to_elf())
+    image = bytes(data.image).ljust(round_up(len(data.image), 4), b"\x00")
+    buf = UOp.placeholder((len(image),), dtypes.uint8, next(UOp.unique_num), device=devs).rtag("program")
+    cached = _qcom_program_cache[key] = (data, patch(buf, [], image))
+  return cached
 
-  def _do_copy(self, src_addr, dest_addr, size, prof_text):
+class QCOMAllocator(Allocator['QCOMDevice']):
+  def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
+    return self.dev.iface.map(options.external_ptr, size) if options.external_ptr else self.dev.iface.alloc(size, uncached=options.uncached)
+
+  def _free(self, storage:BufferStorage, options:BufferSpec):
     self.dev.synchronize()
-    with cpu_profile(prof_text, f"{self.dev.device}:COPY"): ctypes.memmove(dest_addr, src_addr, size)
-
-  def _copyin(self, dest:HCQBuffer, src:memoryview): self._do_copy(mv_address(src), dest.cpu_view().addr, src.nbytes, f"TINY -> {self.dev.device}")
-  def _copyout(self, dest:memoryview, src:HCQBuffer): self._do_copy(src.cpu_view().addr, mv_address(dest), src.size, f"{self.dev.device} -> TINY")
-
-  def _as_buffer(self, src:HCQBuffer) -> memoryview: return to_mv(src.cpu_view().addr, src.size)
-
-  def _do_free(self, opaque, options:BufferSpec): self.dev.iface.free(opaque)
+    self.dev.iface.free(storage)
+  def _offset(self, buf:int, size:int, offset:int) -> int: return buf + offset
 
 def flag(nm, val): return (val << getattr(kgsl, f"{nm}_SHIFT")) & getattr(kgsl, f"{nm}_MASK")
 
@@ -410,7 +377,7 @@ class KGSLIface:
     if PROFILE and self.gpu_id[:2] < (7, 3):
       System.write_sysfs("/sys/class/kgsl/kgsl-3d0/idle_timer", value="4000000000", msg="Failed to disable suspend mode", expected="4294967276")
 
-  def alloc(self, size:int, uncached=False, fill_zeroes=False) -> HCQBuffer:
+  def alloc(self, size:int, uncached=False, fill_zeroes=False) -> BufferStorage:
     flags = flag("KGSL_MEMALIGN", alignment_hint:=12) | kgsl.KGSL_MEMFLAGS_USE_CPU_MAP
     if uncached: flags |= flag("KGSL_CACHEMODE", kgsl.KGSL_CACHEMODE_UNCACHED)
 
@@ -418,33 +385,25 @@ class KGSLIface:
     va_addr = self.fd.mmap(0, bosz, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, alloc.id * 0x1000)
 
     if fill_zeroes: ctypes.memset(va_addr, 0, size)
-    return HCQBuffer(va_addr=va_addr, size=size, meta=(alloc, True), view=MMIOInterface(va_addr, size, fmt='B'), owner=self.dev)
+    return BufferStorage(va_addr, (alloc, True), MMIOInterface(va_addr, size, fmt='B'))
 
-  def map(self, ptr:int, size:int, _fd:int|None=None) -> HCQBuffer:
+  def map(self, ptr:int, size:int, _fd:int|None=None) -> BufferStorage:
     ptr_aligned, size_aligned = (ptr & ~0xfff), round_up(size + (ptr & 0xfff), 0x1000)
     dcache_flush().fxn(ctypes.c_uint64(ptr_line_aligned:=ptr & ~63), ceildiv(ptr + size - ptr_line_aligned, 64))
     try:
       mi = kgsl.IOCTL_KGSL_MAP_USER_MEM(self.fd, hostptr=ptr_aligned, len=size_aligned, memtype=kgsl.KGSL_USER_MEM_TYPE_ADDR)
-      return HCQBuffer(mi.gpuaddr + (ptr - ptr_aligned), size=size, meta=(mi, False), view=MMIOInterface(ptr, size, fmt='B'), owner=self.dev)
+      return BufferStorage(mi.gpuaddr + (ptr - ptr_aligned), (mi, False), MMIOInterface(ptr, size, fmt='B'))
     except OSError as e:
-      if e.errno == 14: return HCQBuffer(va_addr=ptr, size=size, meta=(None, False), view=MMIOInterface(ptr, size, fmt='B'), owner=self.dev)
+      if e.errno == 14: return BufferStorage(ptr, (None, False), MMIOInterface(ptr, size, fmt='B'))
       raise RuntimeError("Failed to map external pointer to GPU memory") from e
 
-  def free(self, mem:HCQBuffer):
+  def free(self, mem:BufferStorage):
     if mem.meta[0] is None: return # external (gpu) ptr
     if not mem.meta[1]: kgsl.IOCTL_KGSL_SHAREDMEM_FREE(self.fd, gpuaddr=mem.meta[0].gpuaddr) # external (cpu) ptr
     else:
       kgsl.IOCTL_KGSL_GPUOBJ_FREE(self.fd, id=mem.meta[0].id)
-      FileIOInterface.munmap(mem.cpu_view().addr, mem.meta[0].mmapsize)
-
-  def submit(self, command:HCQBuffer, size:int) -> int:
-    obj = kgsl.struct_kgsl_command_object(gpuaddr=command.va_addr, size=size, flags=kgsl.KGSL_CMDLIST_IB)
-    req = kgsl.struct_kgsl_gpu_command(cmdlist=ctypes.addressof(obj), numcmds=1, context_id=self.ctx,
-                                       cmdsize=ctypes.sizeof(kgsl.struct_kgsl_command_object))
-    return kgsl.IOCTL_KGSL_GPU_COMMAND(self.fd, __payload=req).timestamp
-
-  def sleep(self, time_spent_since_last_sleep_ms:int):
-    kgsl.IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID(self.fd, context_id=self.ctx, timestamp=self.dev.last_cmd, timeout=0xffffffff)
+      assert mem.host is not None
+      FileIOInterface.munmap(mem.host.addr, mem.meta[0].mmapsize)
 
   def profile_finalize(self):
     with contextlib.suppress(RuntimeError): System.write_sysfs("/sys/class/kgsl/kgsl-3d0/idle_timer", "10", "Failed to reenable suspend mode")
@@ -518,7 +477,7 @@ class MSMIface:
     msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=allocation.handle)
     self.va_allocator.free(allocation.iova)
 
-  def alloc(self, size:int, uncached=False, fill_zeroes=False) -> HCQBuffer:
+  def alloc(self, size:int, uncached=False, fill_zeroes=False) -> BufferStorage:
     if size <= 0: raise ValueError(f"MSM allocation size must be positive, got {size}")
     mapped_size = round_up(size, mmap.PAGESIZE)
     gem = msm_drm.DRM_IOCTL_MSM_GEM_NEW(self.fd, size=mapped_size, flags=msm_drm.MSM_BO_CACHED_COHERENT)
@@ -532,9 +491,9 @@ class MSMIface:
       self._release(allocation)
       raise
     self.allocations[gem.handle] = allocation
-    return HCQBuffer(allocation.iova, size, meta=allocation, view=MMIOInterface(allocation.cpu_addr, size), owner=self.dev)
+    return BufferStorage(allocation.iova, allocation, MMIOInterface(allocation.cpu_addr, size))
 
-  def map(self, ptr:int, size:int, fd:int|None=None) -> HCQBuffer:
+  def map(self, ptr:int, size:int, fd:int|None=None) -> BufferStorage:
     if fd is None: raise ValueError("MSM DRM external pointers require a DMA-BUF fd")
     if size <= 0: raise ValueError(f"MSM mapping size must be positive, got {size}")
     if size > (dma_buf_size:=os.fstat(fd).st_size): raise ValueError(f"Mapping size {size} exceeds DMA-BUF size {dma_buf_size}")
@@ -548,14 +507,14 @@ class MSMIface:
         raise
       self.allocations[imported.handle] = allocation
     else: allocation.refcount += 1
-    return HCQBuffer(allocation.iova, size, meta=allocation, view=MMIOInterface(ptr, size), owner=self.dev)
+    return BufferStorage(allocation.iova, allocation, MMIOInterface(ptr, size))
 
   @staticmethod
-  def _allocation(mem:HCQBuffer) -> MSMAllocation:
-    if not isinstance(allocation:=mem.base.meta, MSMAllocation): raise RuntimeError("MSM buffer was not allocated by the MSM DRM interface")
+  def _allocation(mem:BufferStorage) -> MSMAllocation:
+    if not isinstance(allocation:=mem.meta, MSMAllocation): raise RuntimeError("MSM buffer was not allocated by the MSM DRM interface")
     return allocation
 
-  def free(self, mem:HCQBuffer):
+  def free(self, mem:BufferStorage):
     allocation = self._allocation(mem)
     if allocation.refcount > 1:
       allocation.refcount -= 1
@@ -564,19 +523,11 @@ class MSMIface:
     self._release(allocation)
     del self.allocations[allocation.handle]
 
-  def submit(self, command:HCQBuffer, size:int) -> int:
-    if self.dev.timeline_value > self.max_inflight + 1:
-      self.dev.timeline_signal.wait(self.dev.timeline_value - self.max_inflight - 1)
-    cmd = msm_drm.struct_drm_msm_gem_submit_cmd(type=msm_drm.MSM_SUBMIT_CMD_BUF, size=size, iova=int(command.va_addr))
-    submit = msm_drm.struct_drm_msm_gem_submit(flags=self.submit_flags, nr_cmds=1, cmds=ctypes.addressof(cmd), queueid=self.queue_id)
-    msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT(self.fd, __payload=submit)
-    return submit.fence
-
   def sleep(self, _time_spent_since_last_sleep_ms:int):
-    if self.dev.last_cmd == 0: return
+    if (last_cmd:=self.dev.msm_fence.host.view(fmt="I")[0]) == 0: return
     tv_sec, tv_nsec = divmod(time.monotonic_ns() + MSM_WAIT_SLICE_NS, 1_000_000_000)
     timeout = msm_drm.struct_drm_msm_timespec(tv_sec=tv_sec, tv_nsec=tv_nsec)
-    try: msm_drm.DRM_IOCTL_MSM_WAIT_FENCE(self.fd, fence=self.dev.last_cmd, flags=0, timeout=timeout, queueid=self.queue_id)
+    try: msm_drm.DRM_IOCTL_MSM_WAIT_FENCE(self.fd, fence=last_cmd, flags=0, timeout=timeout, queueid=self.queue_id)
     except OSError as e:
       if e.errno not in {errno.EINTR, errno.ETIMEDOUT}: raise RuntimeError("MSM fence wait failed") from e
 
@@ -584,44 +535,60 @@ class MSMIface:
     msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_CLOSE(self.fd, self.queue_id)
     msm_drm.DRM_IOCTL_MSM_SUBMITQUEUE_CLOSE(self.fd, self.vm_bind_queue_id)
 
-class QCOMGraph(HCQGraph):
-  @staticmethod
-  def supports_uop(batch_devs, new_call):
-    all_devs = QCOMGraph._all_devs(batch_devs, new_call)
-    return all(not isinstance(getattr(d, "iface", None), MSMIface) or getenv("OPENPILOT_HACKS") for d in all_devs) \
-      and HCQGraph.supports_uop(batch_devs, new_call)
-
-class QCOMDevice(HCQCompiled):
+class QCOMDevice(Compiled):
   ifaces = [KGSLIface, MSMIface]
+  sleep_timeout_ms = 0
+  timestamp_divider = 19.2
+  pm_encode = PatternMatcher([
+    (UPat(Ops.CUSTOM_FUNCTION, arg="submit_qcom_compute", name="submit"), lambda ctx, submit: encode_submit(QCOMComputeQueue(ctx, submit))),
+  ])
+
+  @property
+  def has_copy_queue(self) -> bool: return False
 
   def __init__(self, device:str=""):
-    self.device_id = int(device.split(":")[1]) if ":" in device else 0
     self.iface = self._select_iface(device)
     self.gpu_id = self.iface.gpu_id
-
-    # a7xx start with 730x or 'Cxxx', a8xx starts 'Exxx'
+    self._stack:Buffer|None = None
     if self.gpu_id[:2] >= (7, 3): raise RuntimeError(f"Unsupported GPU: chip_id={self.iface.chip_id:#x}")
-
-    self.dummy_buf = self.iface.alloc(0x1000)
-    self.dummy_addr = int(self.dummy_buf.va_addr)
-    self.cmd_buf = self.iface.alloc(16 << 20)
-    self.cmd_buf_allocator = BumpAllocator(size=self.cmd_buf.size, base=int(self.cmd_buf.va_addr), wrap=True)
-    self.border_color_buf = self.iface.alloc(0x1000, fill_zeroes=True)
-    self.last_cmd:int = 0
-
     mesa_gpu_id = getattr(self.iface, "mesa_gpu_id", self.gpu_id[0] * 100 + self.gpu_id[1] * 10 + self.gpu_id[2])
     self.dev_info = mesa.fd_dev_info(mesa.struct_fd_dev_id(mesa_gpu_id, self.iface.chip_id))
     arch = ("a%d%d%d,GPU_ID=%d,CHIP_ID=%#x" % (*self.gpu_id, mesa_gpu_id, self.iface.chip_id)) + \
            (",IMAGE_PITCH_ALIGNMENT=64" if IMAGE else "")
-    super().__init__(device, QCOMAllocator(self), self.iface.renderers, QCOMProgram, QCOMSignal, functools.partial(QCOMComputeQueue, self), arch=arch)
-    self.graph = QCOMGraph
+    super().__init__(device, QCOMAllocator(self), self.iface.renderers, None, arch=arch)
+    self.var_vals = {"msm_fd": self.iface.fd.fd, "msm_queue": self.iface.queue_id, "msm_flags": self.iface.submit_flags} \
+      if isinstance(self.iface, MSMIface) else {"kgsl_fd": self.iface.fd.fd, "kgsl_ctx": self.iface.ctx}
+    self.pm_bufferize = PatternMatcher([
+      (UPat(Ops.PARAM, tag="stack", name="b"), lambda ctx, b: ctx._ensure_stack_size(b.max_numel())),
+      (UPat(Ops.PARAM, tag="msm_fence"), lambda ctx: ctx.msm_fence),
+      (UPat(Ops.PARAM, tag="dummy"), lambda ctx: ctx.dummy),
+      (UPat(Ops.PARAM, tag="border_color"), lambda ctx: ctx.border_color),
+    ]) + self.pm_bufferize
 
-  def _ensure_stack_size(self, sz):
-    if not hasattr(self, '_stack'): self._stack = self.iface.alloc(sz)
-    elif self._stack.size < sz:
-      self.synchronize()
-      self.iface.free(self._stack)
-      self._stack = self.iface.alloc(sz)
+  @functools.cached_property
+  def dummy(self) -> Buffer: return Buffer(self.device, 0x1000, dtypes.uint8, options=BufferSpec(nolru=True), preallocate=True) # cache flush target
+
+  @functools.cached_property
+  def border_color(self) -> Buffer: # zeros: the samplers clamp to a black border
+    return Buffer(self.device, 0x1000, dtypes.uint8, options=BufferSpec(nolru=True), initial_value=bytes(0x1000))
+
+  @functools.cached_property
+  def msm_fence(self) -> Buffer:
+    return Buffer(self.device, 1, dtypes.uint32, options=BufferSpec(nolru=True), initial_value=bytes(4))
+
+  def _wait_signal(self, sig:MMIOInterface|memoryview, value:int, timeout:int|None=None):
+    if isinstance(self.iface, KGSLIface) and sig[0] < value:
+      ts = kgsl.IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID(self.iface.fd, context_id=self.iface.ctx, type=kgsl.KGSL_TIMESTAMP_QUEUED).timestamp
+      with contextlib.suppress(OSError, RuntimeError):
+        kgsl.IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID(self.iface.fd, context_id=self.iface.ctx, timestamp=ts,
+                                                  timeout=int(timeout or self.wait_timeout_ms))
+    super()._wait_signal(sig, value, timeout)
+
+  def _ensure_stack_size(self, sz:int) -> Buffer: # one stack for the device, grown to the deepest program's private memory
+    if self._stack is None or self._stack.nbytes < sz:
+      if self._stack is not None: self.synchronize()
+      self._stack = Buffer(self.device, sz, dtypes.uint8, options=BufferSpec(nolru=True), preallocate=True)
+    return self._stack
 
   def _at_profile_finalize(self):
     super()._at_profile_finalize()

@@ -16,12 +16,12 @@ from tinygrad.codegen.decomp.transcendental import xpow
 def simplify_pow(x:UOp, c:UOp) -> UOp|None:
   if c.val < 0: return x.reciprocal().pow(-c.val)
   if c.val == 0: return x.const_like(1)
-  if int(c.val-0.5)+0.5 == c.val: return x.pow(c.val-0.5) * x.sqrt()
+  if (h := c.val-0.5) < c.val and int(h)+0.5 == c.val: return x.pow(h) * x.sqrt()
   if int(c.val) == c.val: return (y := x.pow(c.val//2)) * y * (x if c.val%2 == 1 else 1)
   return None
 
 def fold_bitcast(root:UOp, c:UOp) -> UOp|None:
-  if c.dtype.fmt is None or root.dtype.fmt is None or c.dtype.itemsize != root.dtype.itemsize: return None
+  if c.dtype.itemsize != root.dtype.itemsize: return None
   # the value is mathematical and may not fit: reading it as bits is the emission that pins it to the stated width
   return root.const_like(bitcast(truncate[c.dtype](c.val), c.dtype, root.dtype))
 
@@ -150,9 +150,9 @@ symbolic_simple = pm_data_invalid + PatternMatcher([
   # ** constant folding **
   # canonicalize casted CONST
   (UPat(Ops.CAST, dtypes.all, name="root", src=(UPat.cvar("c"),)), lambda root, c: root.const_like(c.val)),
-  # collapse committed const conversions when the target has a native constant format. fmt-less targets are emulated and would re-expand this pair.
+  # collapse committed const conversions
   (UPat(Ops.CAST, dtypes.all, name="root", src=(UPat(Ops.CAST, dtypes.all, src=(UPat(Ops.CONST, name="c"),)),)),
-   lambda root,c: root.const_like(c.val) if root.dtype.fmt is not None else None),
+   lambda root,c: root.const_like(c.val)),
   # one rule per spelling: bare has no width, a pair evaluates at its stated width, mixed commits to the promotion
   # NOTE: THREEFRY(const,const) folds via its decomposition
   (UPat(GroupOp.ALU-{Ops.THREEFRY}, src=bare_const, name="a"), fold_const_alu),
@@ -227,8 +227,7 @@ def canonicalize_simplex(X:UOp) -> UOp|None:
 commutative = PatternMatcher([
   # ** COMMUTATIVE flipping (only for index) **
   # NOTE: this can break merging vector math by only flipping some of them
-  (UPat(GroupOp.Commutative, dtype=dtypes.weakint, name='x'), lambda x:
-    x.replace(src=x.src[::-1]) if x.src[1].tuplize < x.src[0].tuplize and not x.src[0].tuplize < x.src[1].tuplize else None),
+  (UPat(GroupOp.Commutative, dtype=dtypes.weakint, name='x'), lambda x: x.replace(src=x.src[::-1]) if x.src[1].tuplize < x.src[0].tuplize else None),
 ])
 
 def fold_where_closure(cond:UOp, t:UOp, f:UOp) -> UOp|None:
@@ -439,7 +438,7 @@ def gated_given_valid(cond:UOp, x:UOp, i:UOp) -> UOp|None:
 
 pm_simplify_valid = PatternMatcher([
   # simplify valid
-  (UPat(Ops.AND, name="valid"), simplify_valid),
+  (UPat(Ops.AND, dtypes.bool, name="valid"), simplify_valid),
   (invalid_gate, gated_given_valid),
 ])
 
@@ -454,10 +453,6 @@ pm_clean_up_group_sink = PatternMatcher([
 ])
 
 sym = symbolic+pm_simplify_valid+PatternMatcher([
-  # ** where **
-  # push cast to branches
-  (UPat.var("s").where(UPat.var("a"), UPat.var("b")).cast().named("cast"),
-   lambda s,a,b,cast: s.where(a.ccast(cast.dtype), b.ccast(cast.dtype))),
   # ** pow **
   ((UPat(Ops.POW, name="p"), lambda p: xpow(*p.src))),
   # ** load/store folding **

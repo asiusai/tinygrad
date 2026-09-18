@@ -5,7 +5,7 @@ from unittest.mock import patch
 import tinygrad.runtime.autogen as autogen
 from tinygrad.helpers import mv_address
 from tinygrad.runtime.autogen import msm_drm
-from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
+from tinygrad.runtime.support.hcq import FileIOInterface
 
 
 def ioctl_number(ioctl):
@@ -72,6 +72,7 @@ def make_iface(fd):
 
   iface = object.__new__(MSMIface)
   iface.dev, iface.fd = SimpleNamespace(last_cmd=0, timeline_value=1, timeline_signal=SimpleNamespace(wait=lambda _: None)), fd
+  iface.dev.msm_fence = SimpleNamespace(host=SimpleNamespace(view=lambda **_: [iface.dev.last_cmd]))
   iface.queue_id, iface.vm_bind_queue_id = 3, 2
   iface.submit_flags = msm_drm.MSM_PIPE_3D0 | msm_drm.MSM_SUBMIT_SUDO
   iface.va_allocator = TLSFAllocator(0x1000_0000, base=0x1234_0000, block_size=mmap.PAGESIZE)
@@ -136,8 +137,8 @@ class TestMSMIface(unittest.TestCase):
 
     buf = iface.alloc(17, fill_zeroes=True)
 
-    self.assertEqual((buf.va_addr, buf.cpu_view().addr, buf.size), (0x1234_0000, fd.cpu_addr, 17))
-    self.assertNotEqual(buf.va_addr, buf.cpu_view().addr)
+    self.assertEqual((buf.buf, buf.host.addr, len(buf.host)), (0x1234_0000, fd.cpu_addr, 17))
+    self.assertNotEqual(buf.buf, buf.host.addr)
     self.assertEqual(fd.memory[:17], bytes(17))
     self.assertEqual(fd.gem_flags, [msm_drm.MSM_BO_CACHED_COHERENT])
     self.assertEqual(fd.mmaps, [(0, mmap.PAGESIZE, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, 0x8000)])
@@ -172,8 +173,8 @@ class TestMSMIface(unittest.TestCase):
       first = iface.map(fd.cpu_addr, 17, 9)
       second = iface.map(fd.cpu_addr + 0x40, 17, 9)
 
-    self.assertEqual((first.va_addr, second.va_addr), (0x1234_0000, 0x1234_0000))
-    self.assertEqual((first.cpu_view().addr, second.cpu_view().addr), (fd.cpu_addr, fd.cpu_addr + 0x40))
+    self.assertEqual((first.buf, second.buf), (0x1234_0000, 0x1234_0000))
+    self.assertEqual((first.host.addr, second.host.addr), (fd.cpu_addr, fd.cpu_addr + 0x40))
     self.assertIs(first.meta, second.meta)
     self.assertEqual(first.meta.refcount, 2)
     self.assertEqual(fd.binds, [(msm_drm.MSM_VM_BIND_OP_MAP, 19, 0x1234_0000, mmap.PAGESIZE)])
@@ -183,35 +184,6 @@ class TestMSMIface(unittest.TestCase):
     iface.free(second)
     self.assertEqual(fd.closed_handles, [19])
     self.assertEqual(fd.binds[-1], (msm_drm.MSM_VM_BIND_OP_UNMAP, 0, 0x1234_0000, mmap.PAGESIZE))
-
-  def test_submit_uses_bound_iova(self):
-    fd = RecordingMSMFile()
-    iface = make_iface(fd)
-    command = HCQBuffer(0x1000_0040, 0x80)
-
-    self.assertEqual(iface.submit(command, 0x20), 42)
-    self.assertEqual(fd.submissions, [(msm_drm.MSM_PIPE_3D0 | msm_drm.MSM_SUBMIT_SUDO, 3,
-                                       [(msm_drm.MSM_SUBMIT_CMD_BUF, 0x20, 0x1000_0040)])])
-
-  def test_submit_bounds_inflight_work(self):
-    fd = RecordingMSMFile()
-    iface = make_iface(fd)
-    waits = []
-    iface.dev.timeline_value = 12
-    iface.dev.timeline_signal = SimpleNamespace(wait=waits.append)
-
-    iface.submit(HCQBuffer(0x1000_0040, 0x80), 0x20)
-
-    self.assertEqual(waits, [3])
-
-  def test_graph_capture_requires_openpilot_hacks(self):
-    from tinygrad.runtime.graph.hcq import HCQGraph
-    from tinygrad.runtime.ops_qcom import MSMIface, QCOMGraph
-
-    dev = SimpleNamespace(iface=object.__new__(MSMIface))
-    with patch.object(QCOMGraph, "_all_devs", return_value=[dev]), patch.object(HCQGraph, "supports_uop", return_value=True):
-      with patch("tinygrad.runtime.ops_qcom.getenv", return_value=0): self.assertFalse(QCOMGraph.supports_uop([], None))
-      with patch("tinygrad.runtime.ops_qcom.getenv", return_value=1): self.assertTrue(QCOMGraph.supports_uop([], None))
 
   def test_wait_fence_uses_absolute_deadline(self):
     from tinygrad.runtime.ops_qcom import MSM_WAIT_SLICE_NS
