@@ -230,7 +230,7 @@ class QCOMComputeQueue(HWQueue):
       # Bound independent schedules in flight; the graph's own fence protects its reusable command buffers.
       tl = timeline(self.devs)
       target = tl.after(cmdbuf).index(1).load()
-      done = tl.after(target, loop:=UOp.loop(next(UOp.unique_num), "msm")).index(0).load()
+      done = tl.after(target, loop:=UOp.loop(-1 - next(UOp.unique_num))).index(0).load()
       ready = done.end(loop, done + MSMIface.max_inflight < target)
       idir, base, nr, struct_t = msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT.args
       ioctl_cmd = (idir << 30) | (ctypes.sizeof(struct_t) << 16) | (base << 8) | nr
