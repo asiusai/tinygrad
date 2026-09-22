@@ -78,8 +78,7 @@ class CPULLVMCompiler(LLVMCompiler):
 class AMDLLVMCompiler(LLVMCompiler):
   def __init__(self, arch: str):
     self.arch = arch
-    # LLVM 21 True16 register packing makes masked FP16 loads nondeterministic on gfx1100.
-    super().__init__("AMDGPU", self.arch, "+cumode" + (",-real-true16" if arch == "gfx1100" else ""))
+    super().__init__("AMDGPU", self.arch, "+cumode")
   def __reduce__(self): return (AMDLLVMCompiler, (self.arch,))
   def compile(self, src:str) -> bytes:
     try: return super().compile(src)
