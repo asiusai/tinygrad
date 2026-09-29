@@ -155,7 +155,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         elif s % 4 == 0:
           k.apply_opt(Opt(OptOps.SPLIT, k.unrollable_dims[-1], (4, AxisType.UNROLL)))
         # if it's small, upcast a second reduce dimension too
-        if s <= 3 and k.unrollable_dims and k.full_shape[k.unrollable_dims[-1]] <= 3:
+        if k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3:
           k.apply_opt(Opt(OptOps.SPLIT, k.unrollable_dims[-1], (0, AxisType.UNROLL)))
       else:
         for splits in [4]:
