@@ -7,9 +7,18 @@ from tinygrad.helpers import round_up
 from tinygrad.renderer.cstyle import ClangRenderer
 from tinygrad.runtime.autogen import mesa
 from tinygrad.uop.ops import UOp
+from tinygrad.uop.spec import spec_full, type_verify
 
 
 class TestQCOM(unittest.TestCase):
+  def test_msm_submit_wait_validates(self):
+    from tinygrad.runtime.ops_qcom import QCOMComputeQueue, MSMIface
+    queue = object.__new__(QCOMComputeQueue)
+    queue.devs = ('QCOM',)
+    queue.dev = SimpleNamespace(iface=object.__new__(MSMIface), tag=lambda name: ('QCOM', name))
+    cmdbuf = UOp.alloc((128,), dtypes.uint8, device='QCOM')
+    type_verify(queue.submit(cmdbuf).sink(), spec_full)
+
   def test_private_memory_register_units(self):
     from tinygrad.runtime.ops_qcom import _qcom_pvtmem_sizes
     self.assertEqual(_qcom_pvtmem_sizes(0, 4096, 2), (0, 0, 0, 0x1000))
