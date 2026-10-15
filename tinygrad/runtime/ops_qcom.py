@@ -5,7 +5,7 @@ assert sys.platform != 'win32'
 from typing import Any
 from tinygrad.device import Compiled, BufferStorage, BufferSpec, Buffer, Device, Allocator, TinyELF
 from tinygrad.runtime.support.hcq2 import HWQueue, HCQ_RUNTIME_DEV, ccall, cstruct, patch, unwrap_view, layout_args, pack_args, make_program
-from tinygrad.runtime.support.hcq2 import cfield, timeline
+from tinygrad.runtime.support.hcq2 import timeline
 from tinygrad.runtime.support.memory import MMIOInterface
 from tinygrad.runtime.support.system import FileIOInterface
 from tinygrad.runtime.autogen import kgsl, mesa, libc, msm_drm
@@ -233,7 +233,7 @@ class QCOMComputeQueue(HWQueue):
       fd, queueid, flags = [UOp.variable(n, 0, 2**31 - 1, dtypes.int32) for n in ("msm_fd", "msm_queue", "msm_flags")]
       cmd = cstruct(msm_drm.struct_drm_msm_gem_submit_cmd, type=msm_drm.MSM_SUBMIT_CMD_BUF,
                     size=cmdbuf.max_numel(), iova=ib.getaddr(self.devs) + ib_off)
-      req = cstruct(msm_drm.struct_drm_msm_gem_submit, flags=flags, nr_cmds=1, cmds=cmd.getaddr(HCQ_RUNTIME_DEV.value), queueid=queueid)
+      req = cstruct(msm_drm.struct_drm_msm_gem_submit, flags=flags, nr_cmds=1, cmds=cmd.getaddr(HCQ_RUNTIME_DEV.device), queueid=queueid)
       # Bound independent schedules in flight; the graph's own fence protects its reusable command buffers.
       tl = timeline(self.devs)
       target = tl.after(cmdbuf).index(1).load()
@@ -244,10 +244,11 @@ class QCOMComputeQueue(HWQueue):
       ret = UOp.alloc((1,), dtypes.int32, device=self.devs[0]).rtag("submit_ret")
       submitted = ret.index(0).store(ccall(libc.dll.ioctl, fd, UOp.const(ioctl_cmd, dtypes.uint32), req.after(ready).index(0)))
       fence = UOp.alloc((1,), dtypes.uint32, 0, device=self.devs[0]).rtag(self.dev.tag("msm_fence"))
-      return fence.index(0).store(cfield(req.after(submitted), msm_drm.struct_drm_msm_gem_submit, "fence").load())
+      offset = msm_drm.struct_drm_msm_gem_submit.fence.offset
+      return fence.index(0).store(req.after(submitted)[offset:offset + 4].bitcast(dtypes.u32).index(0).load())
     fd, ctxid = [UOp.variable(n, 0, 2**31 - 1, dtypes.int32) for n in ("kgsl_fd", "kgsl_ctx")]
     obj = cstruct(kgsl.struct_kgsl_command_object, gpuaddr=ib.getaddr(self.devs) + ib_off, size=cmdbuf.max_numel(), flags=kgsl.KGSL_CMDLIST_IB)
-    req = cstruct(kgsl.struct_kgsl_gpu_command, cmdlist=obj.getaddr(HCQ_RUNTIME_DEV.value), cmdsize=ctypes.sizeof(kgsl.struct_kgsl_command_object),
+    req = cstruct(kgsl.struct_kgsl_gpu_command, cmdlist=obj.getaddr(HCQ_RUNTIME_DEV.device), cmdsize=ctypes.sizeof(kgsl.struct_kgsl_command_object),
                   numcmds=1, context_id=ctxid)
     return qcom_submit(req.after(cmdbuf), UOp.alloc((1,), dtypes.int32, device=self.devs[0]).rtag("submit_ret"), fd)
 
