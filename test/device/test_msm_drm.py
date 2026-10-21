@@ -204,6 +204,21 @@ class TestMSMIface(unittest.TestCase):
     iface.dev.last_cmd = 41
     with self.assertRaisesRegex(RuntimeError, "MSM fence wait failed"): iface.sleep(0)
 
+  def test_wait_fence_returns_after_completion_or_interruption(self):
+    for error in (None, errno.EINTR):
+      with self.subTest(error=error):
+        fd = RecordingMSMFile()
+        fd.wait_errno = error
+        iface = make_iface(fd)
+        iface.dev.last_cmd = 41
+        iface.sleep(0)
+        self.assertEqual(len(fd.waits), 1)
+
+  def test_wait_fence_skips_unsubmitted_queue(self):
+    fd = RecordingMSMFile()
+    make_iface(fd).sleep(0)
+    self.assertEqual(fd.waits, [])
+
   def test_device_fini_closes_queues(self):
     fd = RecordingMSMFile()
     iface = make_iface(fd)

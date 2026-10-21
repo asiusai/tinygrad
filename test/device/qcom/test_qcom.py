@@ -49,7 +49,27 @@ class TestQCOM(unittest.TestCase):
     self.assertIn(pkt4_hdr(mesa.REG_A6XX_HLSQ_CS_CTRL_REG1, 1), words)
     self.assertIn(pkt4_hdr(mesa.REG_A6XX_SP_PS_WAVE_CNTL, 1), words)
     self.assertIn(pkt4_hdr(mesa.REG_A6XX_SP_CS_WIE_CNTL_0, 2), words)
-    self.assertIn(mesa.CACHE_FLUSH_TS | mesa.CP_EVENT_WRITE_0_IRQ, words)
+    flush = words.index(pkt7_hdr(mesa.CP_EVENT_WRITE, 4))
+    self.assertEqual(words[flush + 1], mesa.CACHE_FLUSH_TS)
+
+  def test_msm_barriers_and_signals_do_not_request_irqs(self):
+    from tinygrad.runtime.ops_qcom import QCOMComputeQueue, MSMIface
+    queue = object.__new__(QCOMComputeQueue)
+    queue.devs, queue.blob, queue.patches = ('QCOM',), bytearray(), []
+    queue.dev = SimpleNamespace(tag=lambda name: ('QCOM', name), gpu_id=(6, 3, 5), iface=object.__new__(MSMIface))
+    queue.memory_barrier()
+    queue.signal(UOp.alloc((2,), dtypes.uint64, device='QCOM'), UOp.const(7, dtypes.uint64))
+    words = list(struct.unpack(f'{len(queue.blob) // 4}I', queue.blob))
+    packets = []
+    while words:
+      header, *words = words
+      count, opcode = header & 0x3fff, (header >> 16) & 0x7f
+      packets.append((opcode, words[:count]))
+      words = words[count:]
+    events = [payload[0] for opcode, payload in packets if opcode == mesa.CP_EVENT_WRITE]
+    self.assertEqual(events, [mesa.CACHE_FLUSH_TS, mesa.CACHE_INVALIDATE, mesa.CACHE_FLUSH_TS, mesa.CACHE_FLUSH_TS])
+    self.assertIn((mesa.CP_WAIT_MEM_WRITES, []), packets)
+    self.assertIn((mesa.CP_WAIT_FOR_IDLE, []), packets)
 
   # although part of the QCOM runtime, this tests flushing the CPU's dcache
   @unittest.skipUnless(isinstance(Device["CPU"].renderer, ClangRenderer) and platform.machine().lower() in {"arm64", "aarch64"},

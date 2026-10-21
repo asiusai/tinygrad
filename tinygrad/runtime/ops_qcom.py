@@ -21,7 +21,7 @@ from tinygrad.runtime.support.memory import TLSFAllocator
 if getenv("IOCTL"): import extra.qcom_gpu_driver.opencl_ioctl  # noqa: F401  # pylint: disable=unused-import
 
 BUFTYPE_BUF, BUFTYPE_TEX, BUFTYPE_IBO = 0, 1, 2
-MSM_WAIT_SLICE_NS = 1_000_000
+MSM_WAIT_SLICE_NS = 20_000_000
 
 @functools.cache
 def dcache_flush():
@@ -78,8 +78,8 @@ class QCOMComputeQueue(HWQueue):
     # TODO: 7xx support.
     if write_back: # dirty cache write-back, into the device's dummy buffer
       dummy = UOp.alloc((0x1000,), dtypes.uint8, 0, device=self.devs[0]).rtag(self.dev.tag("dummy"))
-      event = mesa.CACHE_FLUSH_TS | (mesa.CP_EVENT_WRITE_0_IRQ if isinstance(self.dev.iface, MSMIface) else 0)
-      self.cmd(mesa.CP_EVENT_WRITE, event, dummy.getaddr(self.devs), 0)
+      # MSM's kernel submit epilogue supplies the completion IRQ; intermediate flushes only need the memory write.
+      self.cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_FLUSH_TS, dummy.getaddr(self.devs), 0)
     if invalidate: self.cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_INVALIDATE) # invalidate cache lines (following reads from RAM).
     if memsync: self.cmd(mesa.CP_WAIT_MEM_WRITES)
     if sync: self.cmd(mesa.CP_WAIT_FOR_IDLE)
@@ -89,8 +89,7 @@ class QCOMComputeQueue(HWQueue):
   def signal(self, signal:UOp, value:UOp):
     self.cmd(mesa.CP_WAIT_FOR_IDLE)
     if self.dev.gpu_id[:2] < (7, 3):
-      event = qreg.cp_event_write_0(event=mesa.CACHE_FLUSH_TS) | (mesa.CP_EVENT_WRITE_0_IRQ if isinstance(self.dev.iface, MSMIface) else 0)
-      self.cmd(mesa.CP_EVENT_WRITE, event, signal.getaddr(self.devs), value.cast(dtypes.uint32))
+      self.cmd(mesa.CP_EVENT_WRITE, qreg.cp_event_write_0(event=mesa.CACHE_FLUSH_TS), signal.getaddr(self.devs), value.cast(dtypes.uint32))
       self._cache_flush(write_back=True, invalidate=False, sync=False, memsync=False)
     else:
       # TODO: support devices starting with 8 Gen 1. Also, 700th series have convenient CP_GLOBAL_TIMESTAMP and CP_LOCAL_TIMESTAMP
@@ -244,7 +243,7 @@ class QCOMComputeQueue(HWQueue):
       ret = UOp.alloc((1,), dtypes.int32, device=self.devs[0]).rtag("submit_ret")
       submitted = ret.index(0).store(ccall(libc.dll.ioctl, fd, UOp.const(ioctl_cmd, dtypes.uint32), req.after(ready).index(0)))
       fence = UOp.alloc((1,), dtypes.uint32, 0, device=self.devs[0]).rtag(self.dev.tag("msm_fence"))
-      offset = msm_drm.struct_drm_msm_gem_submit.fence.offset
+      offset = getattr(msm_drm.struct_drm_msm_gem_submit, 'fence').offset
       return fence.index(0).store(req.after(submitted)[offset:offset + 4].bitcast(dtypes.u32).index(0).load())
     fd, ctxid = [UOp.variable(n, 0, 2**31 - 1, dtypes.int32) for n in ("kgsl_fd", "kgsl_ctx")]
     obj = cstruct(kgsl.struct_kgsl_command_object, gpuaddr=ib.getaddr(self.devs) + ib_off, size=cmdbuf.max_numel(), flags=kgsl.KGSL_CMDLIST_IB)
@@ -426,7 +425,6 @@ def _open_msm_render_node(path:str) -> FileIOInterface|None:
 class MSMIface:
   count = 1
   renderers = [IR3Renderer]
-  event_write_irq = True
   # Long kernel sequences can hang A635 when too many independent submits are queued.
   max_inflight = 8
 
@@ -524,6 +522,7 @@ class MSMIface:
 
   def sleep(self, _time_spent_since_last_sleep_ms:int):
     if (last_cmd:=self.dev.msm_fence.host.view(fmt="I")[0]) == 0: return
+    # Completion wakes this wait immediately. Bound it so signal timeout checks still run if the GPU stops progressing.
     tv_sec, tv_nsec = divmod(time.monotonic_ns() + MSM_WAIT_SLICE_NS, 1_000_000_000)
     timeout = msm_drm.struct_drm_msm_timespec(tv_sec=tv_sec, tv_nsec=tv_nsec)
     try: msm_drm.DRM_IOCTL_MSM_WAIT_FENCE(self.fd, fence=last_cmd, flags=0, timeout=timeout, queueid=self.queue_id)
