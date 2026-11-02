@@ -54,24 +54,29 @@ class CapturedJit(Generic[ReturnType]):
   _linear: UOp
   expected_names: list[int|str]
   expected_input_info: list[tuple[UOp, tuple[Variable, ...], DType, str]]  # (view, variables, dtype, device) per input
+  input_returns: tuple[tuple[Tensor, UOp], ...] = ()
 
   @functools.cached_property
   def linear(self) -> UOp: return link_linear(self._linear, allow_cache=False) # do not cache jit
 
-  def __reduce__(self): return self.__class__, (self.ret, self._linear, self.expected_names, self.expected_input_info)
+  def __reduce__(self): return self.__class__, (self.ret, self._linear, self.expected_names, self.expected_input_info, self.input_returns)
 
   @functools.cached_property
   def _jit_bufs(self) -> set[UOp]: return {u for u in self._linear.toposort() if u.op is Ops.BUFFER}
 
   @functools.cached_property
-  def _symbolic_ret(self) -> list[tuple[Tensor, UOp, dict[Variable, int]]]:
-    return [(t, *ub) for t in get_parameters(self.ret) if (ub:=t.uop.unbind_all())[1]]
+  def _return_templates(self) -> list[tuple[Tensor, UOp, dict[Variable, int]]]:
+    aliases = {id(t):u for t,u in self.input_returns}
+    return [(t, *ub) for t in get_parameters(self.ret) if (ub:=aliases.get(id(t), t.uop).unbind_all())[1] or id(t) in aliases]
 
   def __call__(self, input_uops:list[UOp], var_vals:dict[str, int]) -> ReturnType:
     concrete = tuple(_copy_input(u) if u in self._jit_bufs else u for u in input_uops)
     if DEBUG >= 1 and len(self.linear.src) >= 10: print(f"jit execs {len(self.linear.src)} calls")
     run_linear(self.linear, var_vals, input_uops=concrete, jit=True)
-    for t,u,vals in self._symbolic_ret: t.uop = u.substitute({v:v.bind(var_vals.get(v.expr, i)) for v,i in vals.items()}, walk=True)
+    for t,u,vals in self._return_templates:
+      replacements = {v:v.bind(var_vals.get(v.expr, i)) for v,i in vals.items()}
+      replacements.update({p:concrete[p.arg.slot] for p in u.toposort() if p.op is Ops.PARAM and not p.is_variable})
+      t.uop = u.substitute(replacements, walk=True)
     return self.ret
 
   def free_intermediates(self):
@@ -91,6 +96,11 @@ def _prepare_jit_inputs(args, kwargs):
   if any(u.is_virtual for u in get_input_uops()): raise JitError("JIT inputs must be real buffers; use .clone()")
   if len(unrealized_tensors := [x for x in tensors if not x.uop.is_realized]): Tensor.realize(*unrealized_tensors)
   input_uops = get_input_uops()
+  # Empty outputs need storage before capture so their buffers are rebound on later calls.
+  for u in input_uops:
+    if u.base.op in (Ops.BUFFER, Ops.MSTACK):
+      buf = u.base.buffer
+      for b in (buf.bufs if isinstance(buf, MultiBuffer) else [buf]): b.ensure_allocated()
   # collect buffer UOps (including MultiBuffer)
   input_buf_uops: list[UOp] = [u.base for u in input_uops if u.base.realized is not None]
   if len(set(input_buf_uops)) != len(input_buf_uops): raise JitError("duplicate inputs to JIT")
@@ -163,7 +173,10 @@ class _TinyJit(Generic[ReturnType]):
       # drop the pre-planning graph: it keeps the whole capture-time working set allocated (big_linear) or referenced (held_bufs).
       # the planned linear only uses the arena/held buffers, so the intermediates must be freed before linking and first exec
       del big_linear, held_bufs
-      self.captured = CapturedJit(ret, linear, names, expected_input_info)
+      replacements = {u:UOp.param(i, u.dtype, u.max_numel(), u.device) for i,u in enumerate(input_buf_uops)}
+      input_returns = tuple((t, t.uop.substitute(replacements, walk=True)) for t in get_parameters(ret)
+                            if any(u in replacements for u in t.uop.toposort()))
+      self.captured = CapturedJit(ret, linear, names, expected_input_info, input_returns)
       ret = self.captured(input_buf_uops, var_vals)
     elif self.cnt >= 2:
       # jit exec

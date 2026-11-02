@@ -16,6 +16,32 @@ def _simple_test(add, extract=lambda x: x, N=10):
   assert_jit_cache_len(add, 1)
 
 class TestJit(unittest.TestCase):
+  def test_empty_output_rebinding(self):
+    import pickle
+    @TinyJit
+    def run(x, outputs): outputs['out'].assign(x + 0.5).realize()
+    for i in range(6):
+      x = Tensor(np.arange(16, dtype=np.float32) + i).realize()
+      out = Tensor.empty(16).realize()
+      if i == 3: run = pickle.loads(pickle.dumps(run))
+      run(x, {'out': out})
+      np.testing.assert_array_equal(out.numpy(), np.arange(16, dtype=np.float32) + i + 0.5)
+
+  def test_empty_output_return_view_rebinding(self):
+    import pickle
+    @TinyJit
+    def run(x, out):
+      out.assign(x + 0.5).realize()
+      return {'full': out, 'view': out.reshape(4, 4)[1:3]}
+    for i in range(6):
+      expected = np.arange(16, dtype=np.float32) + i + 0.5
+      x, out = Tensor(expected - 0.5).realize(), Tensor.empty(16).realize()
+      if i == 3: run = pickle.loads(pickle.dumps(run))
+      result = run(x, out)
+      np.testing.assert_array_equal(out.numpy(), expected)
+      np.testing.assert_array_equal(result['full'].numpy(), expected)
+      np.testing.assert_array_equal(result['view'].numpy(), expected.reshape(4, 4)[1:3])
+
   def test_jit_input_view(self):
     @TinyJit
     def f(x): return (x[2:5].contiguous() + 1).realize()
