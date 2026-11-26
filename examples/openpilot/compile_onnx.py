@@ -7,7 +7,7 @@ from tinygrad.dtype import _to_np_dtype
 from tinygrad.helpers import fetch, DEBUG
 from tinygrad.nn.onnx import OnnxPBParser, OnnxRunner
 from tinygrad.engine.realize import lower_and_compile
-from examples.openpilot.helpers import allocate_inputs, dump_pickle, load_pickle, make_retargetable, benchmark
+from examples.openpilot.helpers import allocate_inputs, dump_pickle, load_pickle, make_retargetable, benchmark, openpilot_onnx_ops, load_kernel_opts
 
 def onnx_metadata(path):
   parser = OnnxPBParser(path, load_external_data=False)
@@ -32,11 +32,14 @@ if __name__ == '__main__':
   parser.add_argument('output')
   parser.add_argument('--benchmark-runs', type=int, default=20)
   parser.add_argument('--out-of-band', action='store_true', help='stream protocol-5 buffers for large models')
+  parser.add_argument('--kernel-opts', help='JSON table of tuned opts per kernel AST key')
   parser.add_argument('--retargetable', action='store_true', help='output retargetable jit (requires recompilation when loading)')
   args = parser.parse_args()
   path = fetch(args.onnx) if '://' in args.onnx else Path(args.onnx)
 
+  if args.kernel_opts: print(f"loaded opts for {load_kernel_opts(args.kernel_opts)} kernels")
   runner = OnnxRunner(path)
+  runner.onnx_ops = openpilot_onnx_ops(runner.onnx_ops)
   properties, output_shapes = onnx_metadata(path)
   metadata = {'metadata': properties, 'input_shapes': {k:v.shape for k,v in runner.graph_inputs.items()}, 'output_shapes': output_shapes}
 

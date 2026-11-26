@@ -11,6 +11,7 @@ from tinygrad.dtype import AddrSpace
 from tinygrad.renderer import Estimates, Renderer, TinyELF
 from tinygrad.codegen import to_program, to_program_cache, to_program_key, to_program_context
 from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool
+from tinygrad.codegen.opt import KERNEL_OPTS
 
 # **************** Helpers ****************
 
@@ -202,6 +203,8 @@ def _compile_kernel(x:tuple[int, tuple[UOp, Renderer], dict]) -> tuple[int, UOp]
 
 def _get_call_to_compile(c:UOp) -> tuple[UOp, Renderer]|None:
   ast = c.body
+  if ast.op is Ops.SINK and isinstance(ast.arg, KernelInfo) and ast.arg.opts_to_apply is None and (opts:=KERNEL_OPTS.get(ast.key)) is not None:
+    ast = ast.replace(arg=replace(ast.arg, opts_to_apply=opts))
   # a PROGRAM with a ProgramInfo and a BINARY is already compiled
   if (ast.op is Ops.SINK and isinstance(ast.arg, KernelInfo)) or \
      (ast.op is Ops.PROGRAM and not (isinstance(ast.arg, ProgramInfo) and ast.src[-1].op is Ops.BINARY)):

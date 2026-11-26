@@ -14,6 +14,9 @@ class Opt:
   arg: int|tuple|None = None
   def __repr__(self): return f"Opt(op={self.op}, axis={self.axis}, arg={self.arg})"
 
+# tuned opts for specific kernels, keyed by the unoptimized kernel AST key. A kernel that is not listed uses the heuristics.
+KERNEL_OPTS: dict[bytes, tuple[Opt, ...]] = {}
+
 class KernelOptError(Exception): pass
 def check(cond:bool, msg:str=""):
   if not cond: raise KernelOptError(msg)

@@ -1,10 +1,11 @@
 """Shared compilation and input allocation for model and warp artifacts."""
-import io, pathlib, pickle, shutil, struct, time, tempfile
+import io, json, pathlib, pickle, shutil, struct, time, tempfile
 import numpy as np
-from typing import Callable
-from tinygrad import Tensor, Device, Context
+from typing import Callable, Sequence
+from tinygrad import Tensor, Device, Context, dtypes
 from tinygrad.device import Buffer
-from tinygrad.uop.ops import PatternMatcher, UPat, Ops, graph_rewrite
+from tinygrad.uop.ops import PatternMatcher, UPat, Ops, graph_rewrite, AxisType
+from tinygrad.codegen.opt import Opt, OptOps, KERNEL_OPTS
 from tinygrad.nn.state import get_parameters
 
 def allocate_inputs(input_specs, initialize=None):
@@ -12,6 +13,32 @@ def allocate_inputs(input_specs, initialize=None):
   arrays = {name: np.zeros(shape, dtype=dtype) for name, (shape, dtype, _) in input_specs.items()}
   if initialize is not None: initialize(arrays)
   return {name: Tensor(arrays[name], device=device).realize() for name, (_, _, device) in input_specs.items()}
+
+def _pending_reduce(t:Tensor) -> bool:
+  """True if computing t runs a reduction that is not stored in its own buffer yet."""
+  gate = lambda u: u.op is not Ops.STAGE and not u.has_buffer_identity()
+  return any(u.op is Ops.REDUCE for u in t.uop.toposort(gate=gate))
+
+def openpilot_onnx_ops(onnx_ops:dict) -> dict:
+  """ONNX ops that schedule faster kernels for the openpilot models. Only the float rounding order changes."""
+  def Concat(*xs:Tensor, axis:int):
+    # a concat of several pending reductions fuses into one kernel that runs every reduction in every thread.
+    # store each reduction first, so each one runs in its own kernel.
+    if sum(map(_pending_reduce, xs)) >= 2: xs = tuple(x.contiguous() if _pending_reduce(x) else x for x in xs)
+    return Tensor.cat(*xs, dim=axis)
+  def ReduceMean(data:Tensor, axes:Sequence[int]|None=None, keepdims:int=1, noop_with_empty_axes:int=0):
+    # a mean of a pending reduction (e.g. a conv) fuses into one reduction with few threads: store the reduction first.
+    # only float32 data, a half buffer would round it
+    if data.dtype == dtypes.float32 and _pending_reduce(data): data = data.contiguous()
+    return onnx_ops['ReduceMean'](data, axes, keepdims, noop_with_empty_axes)
+  return {**onnx_ops, 'Concat': Concat, 'ReduceMean': ReduceMean}
+
+def load_kernel_opts(path) -> int:
+  """Load tuned kernel opts: {"<kernel AST key hex>": [[op, axis, arg], ...]}, a SPLIT arg is [amount, axis type, top]."""
+  def opt(op, axis, arg): return Opt(OptOps[op], axis, (arg[0], AxisType[arg[1]], *arg[2:]) if isinstance(arg, list) else arg)
+  table = json.load(open(path))
+  KERNEL_OPTS.update({bytes.fromhex(k): tuple(opt(*o) for o in v["opts"]) for k, v in table.items()})
+  return len(table)
 
 def dump_pickle(obj, path):
   with tempfile.TemporaryFile(dir=".") as buffers:
