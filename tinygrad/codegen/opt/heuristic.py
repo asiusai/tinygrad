@@ -93,7 +93,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # if there are small dims with lots of valid masks, upcast them (they might be from Tensor.stack)
   to_upcast: list[int] = []
   # Limit IR3 register pressure on mainline (MSM) Adreno until larger unrolls pass workload tests. KGSL keeps the stock limits.
-  qcom_msm = k.ren.target.device == "QCOM" and k.ren.target.interface == "MSM"
+  # The renderer target carries no interface. Only the MSM interface adds GPU_ID to the QCOM architecture string.
+  qcom_msm = k.ren.target.device == "QCOM" and "GPU_ID=" in k.ren.target.arch
   masked_upcast_max = 1 if qcom_msm else 7 * 7
   where_gate_rngs = {r for u in k.ast.backward_slice if u.op is Ops.WHERE for r in u.src[0].ranges}
   # upcast leading axes first (hack-ish for winograd; we actually want to upcast masked axes with low stride first)
