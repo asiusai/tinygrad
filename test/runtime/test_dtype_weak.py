@@ -78,7 +78,7 @@ class TestWeakPromotion(unittest.TestCase):
 class TestWeakBounds(unittest.TestCase):
   def test_bounds_survive_movement(self):
     moved = Tensor(5).reshape(1).expand(2).pad((1, 1)).detach().contiguous_backward()
-    self.assertEqual((moved.uop.vmin, moved.uop.vmax, moved.uop.bufferize().vmax), (0, 5, 5))
+    self.assertEqual((moved.uop.vmin, moved.uop.vmax, moved.uop.stage().vmax), (0, 5, 5))
     self.assertEqual(moved.numpy().dtype, Tensor(5).numpy().dtype)   # a moved weak int reads at the same dtype as the bare one
 
   def test_wide_src_keeps_its_width(self):
@@ -112,6 +112,10 @@ class TestWeakStorageBoundary(unittest.TestCase):
     for t in edges: self.assertEqual(t.item(), 2**40)
     self.assertEqual(Tensor([10, 20, 30])[[2**32+1]].tolist(), [0])  # a wide list index is out of range, not wrapped
     with Context(DEFAULT_INT=dtypes.int64): self.assertEqual(Tensor(2).clone().dtype, dtypes.int64)
+
+  def test_broadcast_weakint_keeps_width(self):
+    x = Tensor([1, 0]).sum(keepdim=True).bool().where(2**33, 0)
+    self.assertEqual(x.expand(2).tolist(), [2**33]*2)  # a materialized weak int is stored wide enough for its bounds
 
   @unittest.skipUnless(dtypes.int64 in Device[Device.DEFAULT].renderer.supported_dtypes(), "long scalar arguments cannot be emulated")
   def test_bound_variable_commits_by_bounds(self):

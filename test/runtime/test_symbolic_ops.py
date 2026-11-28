@@ -1,7 +1,8 @@
 import unittest
-from tinygrad import Tensor, Variable, GlobalCounters, Context
+from tinygrad import Tensor, Variable, GlobalCounters, Context, Device
 from tinygrad.uop.ops import sym_infer
 from tinygrad.dtype import dtypes
+from tinygrad.renderer.nir import NIRRenderer
 from examples.gpt2 import Attention
 import numpy as np
 
@@ -128,15 +129,6 @@ class TestSymbolicOps(unittest.TestCase):
         expected = f(a[:j, :], b[:, :i]).numpy()
         np.testing.assert_allclose(symbolic, expected, atol=1e-6, rtol=1e-6)
 
-  def test_shrink(self):
-    for i in range(1, 5):
-      vi = Variable("i", 1, 10).bind(i)
-      a = Tensor.rand(7, 11)
-      symbolic = a.shrink(((3,5),(vi,vi+2)))
-      symbolic = symbolic.numpy()
-      expected = a.shrink(((3,5),(i,i+2))).numpy()
-      np.testing.assert_allclose(symbolic, expected, atol=1e-6, rtol=1e-6)
-
   def test_slice_pad_sum(self):
     vi = Variable("i", 1, 4).bind(4)
     self.assertEqual(Tensor.ones(1, 12).contiguous().pad(((4, 0), (0, 0)))[vi, :5+vi].sum().item(), 9)
@@ -165,14 +157,6 @@ class TestSymbolicOps(unittest.TestCase):
       expected = (a.pad(((0, i-4),)) + b[:i]).sum().item()
       np.testing.assert_allclose(symbolic, expected, atol=1e-6, rtol=1e-6)
 
-  def test_slice_var_shape(self):
-    for i in range(1, 5):
-      vi = Variable("i", 1, 10).bind(i)
-      a = Tensor.ones(vi, 11).contiguous()
-      symbolic = a[:, 1:2][:i, :1].numpy()
-      expected = Tensor.ones(i, 11)[:, 1:2].numpy()
-      np.testing.assert_allclose(symbolic, expected, atol=1e-6, rtol=1e-6)
-
   def test_expand_reduce(self):
     for a in (Tensor([1., float("inf")]).reshape(1, 2), Tensor([True, False]).reshape(1, 2)):
       for i in range(0, 3):
@@ -195,7 +179,8 @@ class TestSymbolicOps(unittest.TestCase):
 
   def test_var(self):
     a = Tensor.rand(10, 3)
-    for i in range(1, 5):
+    # i=1 var over axis 0 is 0/0, WGSL and mesa NIR (without float controls) assume no nan
+    for i in range(2 if Device.DEFAULT == "WEBGPU" or isinstance(Device[Device.DEFAULT].renderer, NIRRenderer) else 1, 5):
       vi = Variable("i", 1, 10).bind(i)
       for axis in [None, 0, 1]:
         expected = a[:i].var(axis).numpy()

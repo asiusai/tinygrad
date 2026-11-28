@@ -7,7 +7,8 @@ from tinygrad.runtime.support.hcq2 import layout_args, make_program, ins
 from tinygrad.runtime.support.memory import MMIOInterface, BumpAllocator
 from tinygrad.runtime.support.system import FileIOInterface, filter_visible_devices, PCIIfaceBase, MAP_FIXED
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo, uopfunc
-from tinygrad.engine.realize import get_call_arg_uops, get_call_kernel_args, lower_and_compile, run_linear
+from tinygrad.engine.realize import get_call_kernel_args, run_linear
+from tinygrad.codegen.compile import get_call_arg_uops, lower_and_compile
 from tinygrad.device import BufferStorage, Buffer, BufferSpec, Allocator, Compiled, Device, host_of
 from tinygrad.renderer import TinyELF
 from tinygrad.dtype import dtypes, DType, AddrSpace
@@ -108,7 +109,6 @@ def nv_submit(cmdbuf:UOp, ring:UOp, gpput:UOp, doorbell:UOp, put:UOp, token:UOp)
   return doorbell.after(queued).index(0).store(token).sink()
 
 class NVQueue(HWQueue):
-  dev:NVDevice
   q_rewrite = HWQueue.q_rewrite + PatternMatcher([
     (UPat(Ops.CALL, src=(UPat.native("nv"),), allow_any_len=True, name="u"), lambda ctx, u: ctx.q(*u.src[1:])),
   ])
@@ -190,7 +190,7 @@ class NVComputeQueue(NVQueue):
       self.nvm(1, nv_gpu.NVC6C0_SET_SHADER_LOCAL_MEMORY_A, *hilo(lmem.getaddr(self.devs)))
       self.nvm(1, nv_gpu.NVC6C0_SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_A, *data64(self.lmem_per_tpc), 0xff)
     if self.prev_qmd is None:
-      if self.dev.pma_enabled: self.nvm(1, nv_gpu.NVC6C0_PM_TRIGGER, 0)
+      if PMA.value > 0 and PROFILE >= 1: self.nvm(1, nv_gpu.NVC6C0_PM_TRIGGER, 0)
       self.nvm(1, nv_gpu.NVC6C0_SEND_PCAS_A, (qmd_addr >> 8).cast(dtypes.uint32))
       self.nvm(1, nv_gpu.NVC6C0_SEND_SIGNALING_PCAS2_B, nv_gpu.NVC6C0_SEND_SIGNALING_PCAS2_B_PCAS_ACTION_PREFETCH_SCHEDULE)
     else: self.prev_qmd.write(dependent_qmd0_pointer=qmd_addr >> 8, dependent_qmd0_action=1, dependent_qmd0_prefetch=1, dependent_qmd0_enable=1)
@@ -562,7 +562,9 @@ class PCIIface(PCIIfaceBase):
   def rm_alloc(self, parent, clss, params=None, root=None) -> int: return self.dev_impl.gsp.rpc_rm_alloc(parent, clss, params, self.root)
   def rm_control(self, obj, cmd, params=None, **kwargs): return self.dev_impl.gsp.rpc_rm_control(obj, cmd, params, self.root, **kwargs)
 
-  def device_fini(self): self.dev_impl.fini()
+  def device_fini(self):
+    self.dev_impl.gsp.rpc_free(self.root)
+    self.dev_impl.fini()
 
   def sleep(self, timeout):
     for _ in self.dev_impl.gsp.stat_q.read_resp(): pass

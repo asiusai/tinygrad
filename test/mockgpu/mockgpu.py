@@ -1,6 +1,6 @@
-import ctypes, time, os, builtins, fcntl, typing
+import ctypes, time, os, builtins, fcntl, typing, traceback, sys
 from tinygrad.helpers import DEV, dedup, to_tuple, round_up
-from tinygrad.device import Compiled, Device
+from tinygrad.device import Compiled, host_of
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher
 from tinygrad.runtime.support.system import FileIOInterface, System
@@ -15,7 +15,19 @@ drivers = [cls() for t in DEV.value if (cls:={"MOCKPCI+AMD": AMDriver, "MOCKKFD+
                                               "MOCK+NV": NVDriver}.get(f"{t.interface}+{t.device}"))]
 tracked_fds: dict[int, typing.Any] = {}
 
-@ctypes.CFUNCTYPE(None, ctypes.c_uint64)
+def mock_callback(fn):
+  @ctypes.CFUNCTYPE(None, ctypes.c_uint64)
+  def callback(addr):
+    try: fn(addr)
+    except BaseException:
+      # ctypes cannot propagate exceptions to the compiled submit/wait loop. Don't leave it waiting on a failed queue.
+      try:
+        traceback.print_exc()
+        sys.stderr.flush()
+      finally: os._exit(1)
+  return callback
+
+@mock_callback
 def mockgpu_doorbell(addr:int): # compiled stores aren't tracked, so the submits report their doorbells
   for st,en,_,wcb in [x for d in drivers for x in d.tracked_addresses]:
     if st <= addr < en: wcb(None, addr - st)
@@ -23,12 +35,12 @@ setattr(libc.dll, "mockgpu_doorbell", mockgpu_doorbell)
 
 mocked = {t.device for t in DEV.value if t.interface.startswith("MOCK")}
 def hook_doorbells(s:UOp) -> UOp|None:
-  hooks = tuple(UOp.native("mockgpu_doorbell").call(b.after(c).getaddr(Device[d].host)) for c in s.toposort() if c.op is Ops.CALL
+  hooks = tuple(UOp.native("mockgpu_doorbell").call(b.after(c).getaddr(host_of(d))) for c in s.toposort() if c.op is Ops.CALL
                 for b in c.src[1:] if b.op is Ops.EXTERN and "doorbell" in str(b.arg.name) and (d:=to_tuple(b.device)[0]).split(":")[0] in mocked)
   return None if all(h in s.src for h in hooks) else s.replace(src=tuple(dedup(s.src + hooks)))
 Compiled.pm_lower += PatternMatcher([(UPat(Ops.SINK, name="s"), hook_doorbells)])
 
-@ctypes.CFUNCTYPE(None, ctypes.c_uint64)
+@mock_callback
 def mockgpu_progress(_:int): # compiled spin loops wait on the gpus, which run only when called
   for d in drivers: d.progress()
 setattr(libc.dll, "mockgpu_progress", mockgpu_progress)

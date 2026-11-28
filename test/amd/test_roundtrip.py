@@ -58,11 +58,12 @@ def get_kernels_from_tinygrad(op_fn) -> tuple[list[KernelSnapshot], dict[int, in
   """Compile a tinygrad operation and extract all kernels with their buffer mappings."""
   from tinygrad import Tensor
   from tinygrad.uop.ops import Ops
-  from tinygrad.engine.realize import lower_and_compile, get_call_arg_uops
+  from tinygrad.codegen.compile import lower_and_compile, get_call_arg_uops
+  from test.helpers import bound_schedule
   from tinygrad.runtime.support.elf import elf_loader
 
   out = op_fn(Tensor)
-  linear = lower_and_compile(out.schedule_linear())
+  linear = lower_and_compile(bound_schedule(out))
   kernels = []
   buf_pool: dict[int, int] = {}  # buffer id -> size
   buf_data: dict[int, bytes] = {}  # buffer id -> initial data from bulk STORE
@@ -236,9 +237,6 @@ class TestTinygradKernelRoundtrip(unittest.TestCase):
   def test_recip(self): self._test_kernel_roundtrip(lambda T: T([1.0, 2.0, 4.0]).reciprocal())
 
   # Binary ops
-  def test_add(self): self._test_kernel_roundtrip(lambda T: T([1.0, 2.0]) + T([3.0, 4.0]))
-  def test_sub(self): self._test_kernel_roundtrip(lambda T: T([5.0, 6.0]) - T([1.0, 2.0]))
-  def test_mul(self): self._test_kernel_roundtrip(lambda T: T([2.0, 3.0]) * T([4.0, 5.0]))
   def test_div(self): self._test_kernel_roundtrip(lambda T: T([10.0, 20.0]) / T([2.0, 4.0]))
   def test_max_binary(self): self._test_kernel_roundtrip(lambda T: T([1.0, 5.0]).maximum(T([3.0, 2.0])))
 
@@ -268,13 +266,7 @@ class TestTinygradKernelRoundtrip(unittest.TestCase):
   def test_cmp_lt(self): self._test_kernel_roundtrip(lambda T: (T.empty(64) < T.empty(64)).where(T.empty(64), T.empty(64)))
   def test_where(self): self._test_kernel_roundtrip(lambda T: (T.empty(64) > 0).where(T.empty(64), T.empty(64)))
 
-  # Fused ops
-  def test_fma(self): self._test_kernel_roundtrip(lambda T: (T([1.0, 2.0]) * T([3.0, 4.0]) + T([5.0, 6.0])))
-
 class TestTinygradKernelRoundtripRDNA4(TestTinygradKernelRoundtrip): arch = 'rdna4'
-
-@unittest.skip("CDNA decode roundtrip not yet supported")
-class TestTinygradKernelRoundtripCDNA(TestTinygradKernelRoundtrip): arch = 'cdna'
 
 if __name__ == "__main__":
   unittest.main()

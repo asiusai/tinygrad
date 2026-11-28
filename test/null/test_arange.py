@@ -1,7 +1,7 @@
 import unittest
 from tinygrad import Tensor, Variable, dtypes, Device
 from tinygrad.helpers import Context
-from tinygrad.engine.realize import estimate_uop, compile_linear
+from tinygrad.codegen.compile import estimate_uop, compile_linear
 from tinygrad.uop.ops import sym_infer
 from tinygrad.renderer.ptx import PTXRenderer
 
@@ -14,7 +14,8 @@ class TestArange(unittest.TestCase):
 
   def test_symbolic_complexity(self):
     out = Tensor.arange(Variable("n", 1, 2**10).bind(2**9)) + Tensor.empty((), dtype=dtypes.int32)
-    linear, var_vals = out.linear_with_vars()
+    linear, externs = out.linear_with_externs()
+    var_vals = {f"e{i}": x.arg.val for i,x in enumerate(externs) if x.is_bound_var}
     self.assertLessEqual(sym_infer(estimate_uop(compile_linear(linear).src[-1]).ops, var_vals), 2**10*20)
 
   @unittest.skipIf(isinstance(Device[Device.DEFAULT].renderer, PTXRenderer), "PTX indexing is weird")

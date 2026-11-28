@@ -8,13 +8,13 @@ from tinygrad.helpers import DEBUG, Context, CHECK_OOB, all_same, is_image_shape
 
 def validate_index(uidx:UOp, gate:UOp|None=None):
   # skip when OOB checking is off, or for a non final index. TODO: check more complex index with shape
-  if not CHECK_OOB or len(uidx.src) != 2: return True
-  buf,idx = uidx.src
+  if not CHECK_OOB or len(uidx.src) != (3 if uidx.op is Ops.SHRINK else 2): return True
+  buf,idx = uidx.src[:2]
   # TODO: check for overflow
   if idx.is_invalid or is_image_shape(buf._shape): return True
 
-  # buffer size
-  sz = buf.max_numel()
+  # sz is the number of valid start positions: an INDEX accesses one element, a SHRINK(buf, start, length) accesses length
+  sz = buf.max_numel() - (int(uidx.src[2].vmax)-1 if uidx.op is Ops.SHRINK else 0)
 
   # We can use UOp min/max to do a faster check, but it can give false positive since its not an exact bound and doesn't consider the mask
   if 0<=idx.vmin and idx.vmax<sz: return True
@@ -86,7 +86,7 @@ spec_shared = PatternMatcher([
    lambda x: x.arg is None and x.src[2].shape == () and not x.src[2].base.is_invalid),
 
   # PARAM/BUFFER carry a size CONST or an empty STACK for scalars
-  (UPat(Ops.PARAM, src=(p_size,), name="x"), lambda x: isinstance(x.arg, ParamArg)),
+  (UPat(Ops.PARAM, src=(p_size,), name="x"), lambda x: isinstance(x.arg, ParamArg) and x.addrspace is not AddrSpace.TEMPLATE),
   (UPat(Ops.REFPARAM, src=(p_size, UPat(dtype=dtypes.uint64)), name="x"), lambda x: isinstance(x.arg, ParamArg)),
   (UPat(Ops.BUFFER, src=(p_size,), name="x"), lambda x: isinstance(x.arg, ParamArg) and x.addrspace in (AddrSpace.REG, AddrSpace.LOCAL)),
 
@@ -255,7 +255,7 @@ spec_kernel_graph = PatternMatcher([
   # linear for more kernels (TODO: we should enter non sink calls)
   #(UPat(Ops.LINEAR), lambda: True),
   # PARAM is caller-provided storage (or a Variable in the ALU addrspace), EXTERN is storage from outside, ALLOC is call-local storage
-  (UPat(Ops.PARAM, src=(p_size,), name="x"), lambda x: isinstance(x.arg, ParamArg)),
+  (UPat(Ops.PARAM, src=(p_size,), name="x"), lambda x: isinstance(x.arg, ParamArg) and x.addrspace is not AddrSpace.TEMPLATE),
   (UPat(Ops.EXTERN, src=(p_size,), allow_any_len=True, name="x"), lambda x: isinstance(x.arg, ParamArg)),
   (UPat(Ops.BUFFER, src=(p_size,), allow_any_len=True, name="x"), lambda x:
    isinstance(x.arg, ParamArg) and valid_device_range(x.arg.device, x.src[1:]) and

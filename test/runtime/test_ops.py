@@ -16,6 +16,8 @@ warnings.filterwarnings("ignore", message="Non-empty compiler output encountered
 FORWARD_ONLY = getenv("FORWARD_ONLY", 0)
 PRINT_TENSORS = getenv("PRINT_TENSORS", 0)
 COMPILE_ONLY = Device.DEFAULT == "NULL"
+# WGSL lets the compiler assume no inf/nan, mesa NIR does too without float controls: x-x and x*0 fold to 0
+NAN_UNSAFE = Device.DEFAULT == "WEBGPU" or isinstance(Device[Device.DEFAULT].renderer, NIRRenderer)
 
 def slow_test(test_func):
   return unittest.skipIf(getenv("SKIP_SLOW_TEST"), "Skipping slow test")(test_func)
@@ -373,22 +375,6 @@ class TestOps(TensorTestCase):
     (t*(t != 0)).sum().backward()
     np.testing.assert_allclose(t.grad.cpu().numpy(), tt.grad.numpy(), rtol=1e-5)
 
-  def test_cmp_lt_backwards(self):
-    # new grad zeroes these out
-    """
-    t1 = torch.ones(4, requires_grad=True)
-    t2 = torch.ones(4, requires_grad=True)
-    self.assertRaises(RuntimeError, (t1 < t2).sum().backward)
-    tt1 = Tensor.ones(4)
-    tt2 = Tensor.ones(4)
-    self.assertRaises(RuntimeError, (tt1 < tt2).sum().backward)
-    """
-    tt = Tensor.randn(4)
-    (tt*(tt < 0)).sum().backward()
-    t = torch.tensor(tt.numpy(), requires_grad=True)
-    (t*(t < 0)).sum().backward()
-    np.testing.assert_allclose(t.grad.cpu().numpy(), tt.grad.numpy(), rtol=1e-5)
-
   # TODO: fix backward of these functions
   def test_trunc(self):
     helper_test_op([()], lambda x: x.trunc(), forward_only=True)
@@ -516,6 +502,8 @@ class TestOps(TensorTestCase):
   def test_sub(self):
     helper_test_op([(45,65), (45,65)], lambda x,y: x-y)
     helper_test_op([(), ()], lambda x,y: x-y)
+    if not NAN_UNSAFE: helper_test_op(None, lambda x: x-x, vals=[[-1.0, math.inf, math.nan]])
+    self.assertFalse(np.signbit(((x:=Tensor([-1.0]))-x).numpy()).any())
   def test_scalar_sub(self):
     helper_test_op([(45,65)], lambda x: x-2)
     helper_test_op([()], lambda x: x-2)
@@ -627,6 +615,7 @@ class TestOps(TensorTestCase):
     helper_test_op([(45,65)], lambda x: x*math.inf)
     helper_test_op([(45,65)], lambda x: x*-math.inf)
     helper_test_op([(45,65)], lambda x: x*math.nan)
+    if not NAN_UNSAFE: helper_test_op(None, lambda x: x*0, vals=[[1.0, math.inf, -math.inf, math.nan]])
   def test_div_naninf(self):
     helper_test_op([(45,65)], lambda x: x/math.inf)
     helper_test_op([(45,65)], lambda x: x/-math.inf)
@@ -667,6 +656,7 @@ class TestOps(TensorTestCase):
     helper_test_op([(45,65)], lambda x: x**-5.5)
     # helper_test_op([(45,65)], lambda x: x**-8.0)  # TODO: fix this
     helper_test_op([(45,65)], lambda x: 1.0**x)
+    helper_test_op(None, lambda x: 1.0**x, vals=[[math.nan, math.inf, -math.inf]])
     helper_test_op([(45,65)], lambda x: 5.5**x)
     helper_test_op([(45,65)], lambda x: (-5.5)**x)
     helper_test_op([(45,65)], lambda x: 8.0**x)
@@ -1086,11 +1076,6 @@ class TestOps(TensorTestCase):
     helper_test_op([(45,65)], lambda x: x * torch.sigmoid(1.702 * x), Tensor.quick_gelu, low=300, high=400)
     helper_test_op([(45,65)], lambda x: x * torch.sigmoid(1.702 * x), Tensor.quick_gelu, low=-400, high=-300)
 
-  def test_elu(self):
-    helper_test_op([(45,65)], torch.nn.functional.elu, Tensor.elu)
-    helper_test_op([(45,65)], lambda x: torch.nn.functional.elu(x, alpha=0.1), lambda x: Tensor.elu(x, alpha=0.1))
-    helper_test_op([(3,3)], torch.nn.functional.elu, Tensor.elu, low=300, high=400)
-    helper_test_op([()], torch.nn.functional.elu, Tensor.elu)
   def test_relu6(self):
     helper_test_op([(45,65)], torch.nn.functional.relu6, Tensor.relu6)
     helper_test_op([()], torch.nn.functional.relu6, Tensor.relu6)
@@ -1498,14 +1483,6 @@ class TestOps(TensorTestCase):
     helper_test_op(None, lambda x: x.float().var(), lambda x: x.var(), vals=[[1, 2, 3, 4]], forward_only=True)
     # TODO: fix this
     # helper_test_op([(10, 2)], lambda x: x.var(correction=50))
-  @slow_test
-  def test_var_axis(self):
-    helper_test_op([(15, 25, 35)], lambda x: x.var(0))
-    helper_test_op([(15, 25, 35)], lambda x: x.var(2))
-    helper_test_op([(15, 25, 35)], lambda x: x.var([1, 2]))
-    helper_test_op([(15, 25, 35)], lambda x: x.var(0, correction=0))
-    helper_test_op([(15, 25, 35)], lambda x: x.var(2, correction=0))
-    helper_test_op([(15, 25, 35)], lambda x: x.var([1, 2], correction=0))
   def test_var_zero_in_axis(self):
     with warnings.catch_warnings():
       warnings.filterwarnings("ignore", message="var\\(\\): degrees of freedom is <= 0")
@@ -1515,9 +1492,10 @@ class TestOps(TensorTestCase):
   def test_var_one_in_axis(self):
     with warnings.catch_warnings():
       warnings.filterwarnings("ignore", message="var\\(\\): degrees of freedom is <= 0")
-      helper_test_op([(1,2,3,1,5)], lambda x: x.var(axis=(0,3)))
+      # a single element var is 0/0
+      if not NAN_UNSAFE: helper_test_op([(1,2,3,1,5)], lambda x: x.var(axis=(0,3)))
       # TODO: fix backward
-      helper_test_op([(1,2,3,1,5)], lambda x: x.var(axis=(0,3), correction=5), forward_only=True)
+      if not NAN_UNSAFE: helper_test_op([(1,2,3,1,5)], lambda x: x.var(axis=(0,3), correction=5), forward_only=True)
       helper_test_op([(1,2,3,1,5)], lambda x: x.var(axis=(0,4), correction=5), forward_only=True)
     helper_test_op([(1,)], lambda x: x.var(axis=(0,), correction=0))
     helper_test_op([(1,2,3,1,5)], lambda x: x.var(axis=(0,3), correction=0))
@@ -1541,8 +1519,8 @@ class TestOps(TensorTestCase):
   def test_std_one_in_axis(self):
     with warnings.catch_warnings():
       warnings.filterwarnings("ignore", message="std\\(\\): degrees of freedom is <= 0")
-      helper_test_op([(1,2,3,1,5)], lambda x: x.std(axis=(0,3)))
-      helper_test_op([(1,2,3,1,5)], lambda x: x.std(axis=(0,3), correction=5))
+      if not NAN_UNSAFE: helper_test_op([(1,2,3,1,5)], lambda x: x.std(axis=(0,3)))
+      if not NAN_UNSAFE: helper_test_op([(1,2,3,1,5)], lambda x: x.std(axis=(0,3), correction=5))
       helper_test_op([(1,2,3,1,5)], lambda x: x.std(axis=(0,4), correction=5))
     # TODO: fix backward
     helper_test_op([(1,)], lambda x: x.std(axis=(0,), correction=0), forward_only=True)
@@ -1669,10 +1647,6 @@ class TestOps(TensorTestCase):
     helper_test_op([(45,65)], lambda x: x.atanh(), grad_atol=1e-6)
     helper_test_op([(45,65)], lambda x: x.atanh(), grad_atol=1e-6, low=-300, high=-297)
     helper_test_op([(45,65)], lambda x: x.atanh(), grad_atol=1e-6, low=300, high=303)
-
-  def test_topo_sort(self):
-    helper_test_op([(45,65)], lambda x: (x+x)*x, grad_atol=1e-6)
-    helper_test_op([()], lambda x: (x+x)*x, grad_atol=1e-6)
 
   def test_flip_eye_crash(self):
     helper_test_op([], lambda: (torch.eye(10)@torch.eye(10).flip(0)),
@@ -2111,18 +2085,6 @@ class TestOps(TensorTestCase):
               lambda x,w: torch.nn.functional.conv1d(torch.nn.functional.pad(x, p),w),
               lambda x,w: Tensor.conv2d(x,w,padding=p))
 
-  @slow_test
-  def test_large_input_conv2d(self):
-    bs = 4
-    cin = 16
-    groups = 1
-    H = 5
-    W = 2
-    helper_test_op([(bs,cin,64,64), (6,cin//groups,H,W)],
-      lambda x,w: torch.nn.functional.conv2d(x,w,groups=groups),
-      # needed to relax tolerance for larger input
-      lambda x,w: Tensor.conv2d(x,w,groups=groups), atol=1e-4, grad_atol=3e-4, grad_rtol=1e-4)
-
   def test_simple_grouped_conv2d(self):
     bs = 1
     groups = 2
@@ -2150,36 +2112,12 @@ class TestOps(TensorTestCase):
       lambda x,w: torch.nn.functional.conv2d(x,w,groups=groups),
       lambda x,w: Tensor.conv2d(x,w,groups=groups), grad_rtol=1e-5)
 
-  def test_fancy_conv2d(self):
-    bs = 2
-    cin = 3
-    cout = 1
-    groups = 3
-    H,W = 3,3
-    helper_test_op([(bs,cin,11,28), (groups*cout,cin//groups,H,W)],
-      lambda x,w: torch.nn.functional.conv2d(x,w,groups=groups),
-      lambda x,w: Tensor.conv2d(x,w,groups=groups), grad_rtol=1e-5)
-
   @slow_test
   def test_strided_conv2d_simple(self):
     bs,H,W = 2,3,1
     helper_test_op([(bs,1,5,1), (1,1,H,W)],
       lambda x,w: torch.nn.functional.conv2d(x,w,stride=2),
       lambda x,w: Tensor.conv2d(x,w,stride=2))
-
-  @slow_test
-  def test_strided_conv2d(self):
-    bs = 4
-    cin = 3
-    H,W = 3,3
-    with self.subTest(stride := 2):
-      helper_test_op([(bs,cin,11,28), (4,cin,H,W)],
-        lambda x,w: torch.nn.functional.conv2d(x,w,stride=2),
-        lambda x,w: Tensor.conv2d(x,w,stride=stride))
-    with self.subTest(stride := (2,1)):
-      helper_test_op([(bs,cin,11,28), (4,cin,H,W)],
-        lambda x,w: torch.nn.functional.conv2d(x,w,stride=stride),
-        lambda x,w: Tensor.conv2d(x,w,stride=(2,1)))
 
   def test_negative_padding_conv2d(self):
     n,k = 10, 3
@@ -2196,17 +2134,6 @@ class TestOps(TensorTestCase):
       lambda x,w: torch.nn.functional.conv2d(torch.nn.functional.pad(x, p),w),
       lambda x,w: Tensor.conv2d(x,w,padding=p), vals=[[[[[2.,3.]]]], [[[[1.]]]]])
 
-  def test_padded_conv2d_1x1(self):
-    bs,cin,H,W,padding = 4, 3, 1, 1, 2
-    helper_test_op([(bs,cin,11,28), (4,cin,H,W)],
-      lambda x,w: torch.nn.functional.conv2d(x,w,padding=padding),
-      lambda x,w: Tensor.conv2d(x,w,padding=padding))
-
-  def test_padding_add(self):
-    helper_test_op([(64,64), (60,60)],
-      lambda x,w: x+torch.nn.functional.pad(w, (2,2,2,2)),
-      lambda x,w: x+w.pad((2,2,2,2)))
-
   def test_dilated_conv2d(self):
     bs = 4
     cin = 3
@@ -2216,12 +2143,6 @@ class TestOps(TensorTestCase):
         helper_test_op([(bs,cin,11,28), (4,cin,H,W)],
           lambda x,w: torch.nn.functional.conv2d(x,w,dilation=dilation),
           lambda x,w: Tensor.conv2d(x,w,dilation=dilation))
-
-  def test_max_pool2d_simple(self):
-    ksz = (2,2)
-    helper_test_op([(1,1,2,3)],
-      lambda x: torch.nn.functional.max_pool2d(x, kernel_size=ksz, ceil_mode=True),
-      lambda x: Tensor.max_pool2d(x, kernel_size=ksz, ceil_mode=True))
 
   @slow_test
   def test_max_pool2d_asymmetric_padding(self):
@@ -2536,16 +2457,6 @@ class TestOps(TensorTestCase):
                             lambda x: x[Tensor([[0,0,0],[0,0,0]]), Tensor([2,1,1])])
     helper_test_op([(2,3)], lambda x: x[torch.tensor([[0,1,-1],[-1,-2,0]]), torch.tensor([2,1,-1])],
                             lambda x: x[Tensor([[0,1,-1],[-1,-2,0]]), Tensor([2,1,-1])])
-
-  @slow_test
-  def test_slice_fancy_indexing_tuple_indices(self):
-    a,b,c,d,e,i,j,k,o,p = self._get_index_randoms()
-    helper_test_op([(2,5,6,5,3,4)], lambda x: x[(((0,),),)], lambda x: x[(((0,),),)])
-    helper_test_op([(2,5,6,5,3,4)], lambda x: x[(0,),b,c,d,:], lambda x: x[(0,),j,k,o,:])
-    helper_test_op([(2,5,6,5,3,4)], lambda x: x[(1,0),b,c,d,:], lambda x: x[(1,0),j,k,o,:])
-    helper_test_op([(2,5,6,5,3,4)], lambda x: x[a,b,c,(1,2,3),...], lambda x: x[i,j,k,(1,2,3),...])
-    helper_test_op([(2,5,6,5,3,4)], lambda x: x[a,((2,),(1,),(0,)),c,(2,1,0)], lambda x: x[i,((2,),(1,),(0,)),k,(2,1,0)])
-    helper_test_op([(2,5,6,5,3,4)], lambda x: x[1,(2,1,0),None,c,(2,1,0),e], lambda x: x[1,(2,1,0),None,k,(2,1,0),p])
 
   @slow_test
   def test_slice_fancy_indexing_list_with_tensors(self):

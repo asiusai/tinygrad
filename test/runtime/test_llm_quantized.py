@@ -3,7 +3,7 @@ import itertools
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, function, Device, TinyJit
 from tinygrad.helpers import Context
-from tinygrad.llm.gguf import ggml_data_to_tensor, QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS
+from tinygrad.llm.gguf import ggml_data_to_tensor, QUANT_SIZES, SMALL_BLOCK_QUANTS
 from tinygrad.llm.model import Linear, ExpertWeights, fp8_matmul, amd_custom_kernels_supported
 from tinygrad.llm.hf import e4m3fn_to_fnuz
 from test.helpers import needs_devices
@@ -91,7 +91,7 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
         assert linear.packed is not None
         linear.packed.realize()
         self.assertEqual(linear.ggml_type, ggml_type)
-        self.assertEqual(linear.packed.dtype, dtypes.uint8 if ggml_type == 39 else dtypes.uint16 if ggml_type in HALFWORD_QUANTS else dtypes.uint32)
+        self.assertEqual(linear.packed.dtype, dtypes.uint8)
         self.assertEqual(linear.packed.nbytes(), type_size)
         np.testing.assert_array_equal(linear.packed.bitcast(dtypes.uint8).numpy(), packed[offset:])
         raw.assign(raw.full_like(1)).realize()
@@ -126,19 +126,8 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     linear = Linear(256, 16, bias=False)
     linear.weight = ggml_data_to_tensor(raw, 16 * 256, 8).reshape(16, 256)
     x = rng.normal(size=(2, 256)).astype(np.float32)
-    with patch("tinygrad.llm.model._slop_uop", return_value=None):
+    with patch("tinygrad.llm.model._load_kernel", return_value=None):
       np.testing.assert_allclose(linear(Tensor(x)).numpy(), x @ weight.T, rtol=1e-4, atol=1e-4)
-
-  def test_slop_provider_error_falls_back(self):
-    from unittest.mock import patch
-    from tinygrad.llm.model import _slop_uop
-    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("slopkernels AMD required")
-    _slop_uop.cache_clear()
-    try:
-      with patch("slopkernels.get", side_effect=TypeError("bad spec")):
-        self.assertIsNone(_slop_uop("dense_linear", (11, 0, 0), "AMD", (((64, 128), (64, 128), None, "f16"), ((1, 128), (1, 128), None, "f32"))))
-    finally:
-      _slop_uop.cache_clear()
 
   @unittest.skipIf(Device.DEFAULT == "WEBGPU", "slow on WEBGPU")
   def test_quant_linear_fallback(self):

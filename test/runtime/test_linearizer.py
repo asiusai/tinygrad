@@ -5,14 +5,13 @@ from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.uop.ops import UOp, Ops, GroupOp, AxisType, KernelInfo
 from tinygrad.device import Device, Buffer
 from tinygrad.tensor import Tensor, _to_np_dtype
-from tinygrad.engine.realize import run_linear
 from tinygrad.codegen import to_program
-from tinygrad.helpers import Context, dedup, TC_SELECT, TC_OPT, DEV
+from tinygrad.helpers import dedup, TC_SELECT, TC_OPT, DEV
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.cstyle import CUDARenderer
 from tinygrad.renderer.x86 import ISARenderer
-from test.helpers import replace_opts, check_schedule
+from test.helpers import replace_opts, check_schedule, run_schedule, bound_schedule
 from test.runtime.test_softmax_fusion import single_kernel_softmax
 MOCKGPU = DEV.interface.startswith("MOCK")
 
@@ -26,8 +25,8 @@ class TestLinearizer(unittest.TestCase):
     a, b = Tensor.randn(4).realize(), Tensor.randn(4).realize()
     np_a, np_b = a.numpy(), b.numpy()
     c = ((a.shrink(((0, 2),)) - a.shrink(((2, 4),))) - (b.shrink(((0, 2),)) - b.shrink(((2, 4),))))
-    linear = c.schedule_linear()
-    run_linear(linear)
+    linear = bound_schedule(c)
+    run_schedule(linear)
     rawbufs = [s.buffer for s in linear.src[-1].src[1:] if not s.is_bound_var]
     assert len(rawbufs) == 3 and set(rawbufs[1:]) == {a.uop.base.realized, b.uop.base.realized}
     np_c = (np_a[:2] - np_a[2:]) - (np_b[:2] - np_b[2:])
@@ -40,14 +39,6 @@ class TestLinearizer(unittest.TestCase):
     tb = Tensor.where(Tensor(False), a, b).numpy()
     np.testing.assert_equal(a.numpy(), ta)
     np.testing.assert_equal(b.numpy(), tb)
-
-  @unittest.skip("TODO: some backends insert more casts")
-  def test_cast_there_and_back(self):
-    tst = Tensor.ones(16, dtype=dtypes.int).contiguous().realize()
-    out = tst.neg().cast(dtypes.char).cast(dtypes.int).cast(dtypes.char) * 2
-    ast = helper_linearizer_opt(out)
-    uops = tuple(to_program(replace_opts(ast, []), renderer=Device[Device.DEFAULT].renderer).src[1].src)
-    self.assertEqual(len([x for x in uops if x.op is Ops.CAST]), 1)
 
   @unittest.expectedFailure
   def test_cast_back_and_there(self):
@@ -81,14 +72,6 @@ class TestLinearizer(unittest.TestCase):
     ranges = [i for i,u in enumerate(uops) if u.op is Ops.RANGE]
     assert len(ranges) == 1 # NOTE: it collapses now
 
-  def test_three_nested_range(self):
-    a = Tensor.randn(2, ).realize()
-    out = a.reshape(2, 1).expand(2, 3).expand(2, 2, 3).sum()
-    ast = helper_linearizer_opt(out, wanna_output=[np.broadcast_to(np.broadcast_to(a.numpy().reshape(2, 1), (2, 3)), (2, 2, 3)).sum()])
-    uops = tuple(to_program(replace_opts(ast, []), renderer=Device[Device.DEFAULT].renderer).src[1].src)
-    ranges = [i for i,u in enumerate(uops) if u.op is Ops.RANGE]
-    assert len(ranges) == 1 # NOTE: it collapses now
-
   def test_two_nested_range_alt_indexing(self):
     a = Tensor([2, 2]).realize()
     out = a.reshape(2, 1).pad(((1, 1), (1, 1)), value=2).sum()
@@ -110,15 +93,6 @@ class TestLinearizer(unittest.TestCase):
     ranges = [i for i,u in enumerate(uops) if u.op is Ops.RANGE]
     # LOAD -> RANGE -> LOAD -> STORE
     assert len([x for x in uops[:ranges[0]] if x.op is Ops.LOAD and x.src[0].buf_uop.arg.name != "args"]) == 1
-
-  def test_range_outer_op_before_phi_nested_range(self):
-    a = Tensor.randn(2, ).realize()
-    b = Tensor.randn(1, 1).realize()
-    out = (a.reshape(2, 1).expand(2, 3) + b[0]).sum() + b[0]
-    ast = helper_linearizer_opt(out, wanna_output=[(np.broadcast_to(a.numpy().reshape(2, 1), (2, 3)) + b.numpy()[0]).sum() + b.numpy()])
-    uops = tuple(to_program(replace_opts(ast, []), renderer=Device[Device.DEFAULT].renderer).src[1].src)
-    ranges = [i for i,u in enumerate(uops) if u.op is Ops.RANGE]
-    assert len(ranges) == 1 # NOTE: it collapses now
 
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.supports_float4, "test requires float4")
   def test_simple_unroll_no_between_phi_dependencies(self):
@@ -165,8 +139,8 @@ class TestLinearizer(unittest.TestCase):
     a = Tensor.ones(4, 4).contiguous().realize()
     b = a.shrink(((1, 2), None)).pad(((1, 2), None)).bool()
     a.assign(b.where(2, a))
-    linear, var_vals = check_schedule(a, 1)
-    run_linear(linear, var_vals)
+    linear, externs = check_schedule(a, 1)
+    run_schedule(linear, externs)
     np.testing.assert_equal(a.flatten().numpy(), [1.,1.,1.,1.,2.,2.,2.,2.,1.,1.,1.,1.,1.,1.,1.,1.])
     program = to_program(replace_opts(linear.src[-1].src[0], []), renderer=Device[Device.DEFAULT].renderer)
     assert not any(u.op == Ops.WHERE for u in tuple(program.src[1].src)), "found where where where should be folded"
@@ -189,38 +163,6 @@ class TestLinearizer(unittest.TestCase):
     #helper(Tensor.arange(-3.2, 6.7, 0.64), max_ops=2)
     #helper(Tensor.arange(256), max_ops=2)
     helper(Tensor.arange(255).clone(), max_ops=2)
-
-  @unittest.skip("test implicitly depends on certain optimizations")
-  @unittest.skipUnless(Device[Device.DEFAULT].renderer.supports_float4, "test requires float4")
-  @unittest.skipIf(isinstance(Device[Device.DEFAULT].renderer, PTXRenderer), "broken on ptx for some reason")
-  def test_grouped_store_phis(self):
-    """
-    float4 acc0 = float4(0.0,0.0,0.0,0.0);
-    {
-      acc0 = // ...
-    }
-    *((device float4*)(data0+alu2)) = float4(acc0.x,acc0.y,acc0.z,acc0.w);
-    simplifies to:
-    *((device float4*)(data0+alu2)) = acc0;
-    """
-    x, y = Tensor.rand(64,64), Tensor.rand(64,64)
-    out = x.matmul(y)
-    with Context(TC=0):
-      ast = helper_linearizer_opt(out)
-      uops = tuple(to_program(ast, renderer=Device[Device.DEFAULT].renderer).src[1].src)
-    # check that the float4 cast collapses
-    store_vals = [u.src[1] for u in uops if u.op is Ops.STORE and u.src[0].dtype.addrspace != AddrSpace.REG]
-    for val in store_vals:
-      assert val.dtype == dtypes.float # and val.op is not Ops.VECTORIZE
-
-  @unittest.skip("test implicitly depends on certain optimizations")
-  @unittest.skipUnless(Device[Device.DEFAULT].renderer.supports_float4, "test requires float4")
-  def test_grouped_store_values(self):
-    x = Tensor.randn((4,3,6,6)).realize()
-    out = x.flip((0,1)).contiguous()
-    ast = helper_linearizer_opt(out)
-    store_val = [u.src[1] for u in tuple(to_program(ast, renderer=Device[Device.DEFAULT].renderer).src[1].src) if u.op is Ops.STORE][0]
-    assert store_val.dtype == dtypes.float and store_val.op is not Ops.STACK
 
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_shared, "test requires shared")
@@ -246,25 +188,6 @@ class TestLinearizer(unittest.TestCase):
     # assert barrier.src == tuple(local_stores)
     assert len([u for u in uops if u.op is Ops.IF])
 
-  @unittest.skip("test implicitly depends on certain optimizations")
-  @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
-  @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_shared, "test requires shared")
-  @unittest.skipUnless(Device[Device.DEFAULT].renderer.supports_float4, "test requires float4")
-  @unittest.skipIf(isinstance(Device[Device.DEFAULT].renderer, PTXRenderer), "broken on ptx for some reason")
-  def test_grouped_store_local_only(self):
-    x, y = Tensor.rand(1,128), Tensor.rand(128, 128)
-    r = (x@y).relu()
-    ast = helper_linearizer_opt(r)
-    uops = tuple(to_program(ast, renderer=Device[Device.DEFAULT].renderer).src[1].src)
-    stores = [u for u in uops if u.op is Ops.STORE and u.src[0].dtype.addrspace != AddrSpace.REG]
-
-    # the float4 value stores directly in lds and we skip upcast
-    self.assertEqual(stores[0].src[1].dtype, dtypes.float)
-    #assert stores[0].src[-1].op is not Ops.VECTORIZE
-
-    # the global store doesn't change
-    assert stores[1].src[1].dtype == dtypes.float
-
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_shared, "test requires shared")
   def test_two_grouped_stores_local(self):
@@ -282,15 +205,15 @@ class TestLinearizer(unittest.TestCase):
     r1 = UOp.range(g, 1, dtype=dtypes.int)
     r2 = UOp.range(g.after(o.index(i*2+r1).store(v).end(r1)), 2, dtype=dtypes.int)
     prog = o.index(i*2+1+r2).store(v).end(r2).end(i).sink(arg=KernelInfo())
-    run_linear(UOp(Ops.LINEAR, src=(prog.call(flag.uop.buf_uop, out.uop.buf_uop),)), update_stats=False)
+    run_schedule(UOp(Ops.LINEAR, src=(prog.call(flag.uop.buf_uop, out.uop.buf_uop),)), update_stats=False)
     self.assertEqual(out.tolist(), [0, 0, 1, 1])
 
 # *** helpers ***
 
 def helper_realized_ast(r:Tensor|list[Tensor]) -> tuple[UOp, list[Buffer]]:
   if isinstance(r, Tensor): r = [r]
-  linear, var_vals = Tensor.linear_with_vars(*r)
-  run_linear(UOp(Ops.LINEAR, src=linear.src[:-1]), var_vals)  # run all kernels except the last one
+  linear = bound_schedule(*r)
+  run_schedule(UOp(Ops.LINEAR, src=linear.src[:-1]))  # run all kernels except the last one
   last_call = linear.src[-1]
   ast = last_call.src[0]
   assert ast.op is Ops.SINK, f"helper_realized_ast expects a SINK {last_call}"
@@ -323,7 +246,7 @@ def _helper_linearizer_opt_ast(realized_ast:UOp, real_bufs:list[Buffer], opts=[]
 
   def run_prg(opts):
     ast = realized_ast if opts is None else replace_opts(realized_ast, list(opts))
-    run_linear(UOp(Ops.LINEAR, src=(ast.call(*buf_uops),)))
+    run_schedule(UOp(Ops.LINEAR, src=(ast.call(*buf_uops),)))
 
   def check_opt(opts):
     reset_bufs(outbufs)

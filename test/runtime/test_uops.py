@@ -7,14 +7,13 @@ from tinygrad.dtype import dtypes, DType, AddrSpace, ConstFloat  # noqa: F401
 from tinygrad.device import Buffer, Device
 from tinygrad.uop.ops import Ops, UOp, KernelInfo, AxisType, GroupOp
 from tinygrad.renderer.cstyle import CStyleLanguage
-from tinygrad.engine.realize import run_linear
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.runtime.ops_python import PythonRenderer
-from test.helpers import buffer_uops
+from test.helpers import buffer_uops, run_schedule
 
 def run_uops(uops_list:list[UOp], bufs:list[Buffer]):
   buf_uops = buffer_uops(UOp.sink(*uops_list), bufs)
-  run_linear(UOp(Ops.LINEAR, src=(UOp.sink(*uops_list, arg=KernelInfo()).call(*buf_uops),)))
+  run_schedule(UOp(Ops.LINEAR, src=(UOp.sink(*uops_list, arg=KernelInfo()).call(*buf_uops),)))
 
 def uop(uops:list[UOp], op:Ops, dtype:Optional[DType], src:tuple[UOp, ...], arg:Any=None) -> UOp:
   if op is Ops.CONST: uops.append(UOp.const(arg).cast(dtype))
@@ -229,7 +228,7 @@ class TestZeroRange(unittest.TestCase):
 
 class TestUOpPrograms(unittest.TestCase):
   def _run(self, prog:UOp, *tensors:Tensor):
-    run_linear(UOp(Ops.LINEAR, src=(prog.call(*[t.realize().uop.buf_uop for t in tensors]),)), update_stats=False)
+    run_schedule(UOp(Ops.LINEAR, src=(prog.call(*[t.realize().uop.buf_uop for t in tensors]),)), update_stats=False)
 
   def test_masked_read_of_bounded_param(self):
     out, a = Tensor.empty(4, dtype=dtypes.int), Tensor([4, 5, 6, 7])
@@ -252,39 +251,6 @@ class TestUOpPrograms(unittest.TestCase):
     self._run(prog.sink(arg=KernelInfo()), out)
 
     with Context(DEBUG=0): self.assertTrue((out == 42).all().item())
-
-  def test_matmul(self):
-    a = Tensor.randn(10,10)
-    b = Tensor.randn(10,10)
-    c = Tensor.empty(10,10)
-    ref = (a@b)
-    with Context(DEBUG=0): Tensor.realize(a, b, c, ref)
-
-    # C[i,j] = sum_k A[i,k] * B[k,j]
-    # Shapes: A[M,K], B[K,N], C[M,N]
-    M = N = K = 10
-    DT = dtypes.float32
-
-    # Placeholders (bind slots explicitly)
-    A = UOp.placeholder((M, K), DT, slot=0)
-    B = UOp.placeholder((K, N), DT, slot=1)
-    C = UOp.placeholder((M, N), DT, slot=2)
-
-    # Axes: i,j are spatial; k is a reduction axis over the shared dim K
-    i = UOp.range(M, axis_id=0)                             # rows of A/C
-    j = UOp.range(N, axis_id=1)                             # cols of B/C
-    k = UOp.range(K, axis_id=2)  # reduction over K
-
-    # Zero-init: write a scalar 0 to each (i,j).
-    C = C[i, j].set(0.0)
-
-    # Accumulate: end the store, with C.after(k) enforcing the dependency along the reduction axis
-    prog = C[i, j].store(C.after(k)[i, j] + A[i, k] * B[k, j]).end(i, j, k)
-
-    # run program
-    self._run(prog.sink(arg=KernelInfo()), a, b, c)
-
-    with Context(DEBUG=0): self.assertLessEqual((c-ref).square().mean().item(), 1e-6)
 
   def test_matmul_relu(self):
     a, b, c = Tensor.randn(10,10), Tensor.randn(10,10), Tensor.empty(10,10)

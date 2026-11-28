@@ -25,9 +25,9 @@ def forward_call_outputs(sink:UOp) -> UOp:
     # Forward the allocation, not just one view of it, so saved values and other aliases follow the same placement.
     key = base if base.op is Ops.ALLOC else src
     if key not in placed and (src.op is Ops.STAGE or target.has_buffer_identity()) and \
-       target.storage_base not in st.src[1].toposort():
-      if base.op is Ops.ALLOC and src.has_buffer_identity() and base.max_numel() == target.storage_base.max_numel():
-        placed[key] = target.storage_base
+       (tb := target.storage_base) not in st.src[1].toposort():
+      if base.op is Ops.ALLOC and src.has_buffer_identity(after_ok=True) and base.numel() == tb.numel():
+        placed[key] = tb if base.shape == tb.shape else tb.reshape(base.shape)
       elif src.op is Ops.STAGE: placed[key] = target.after(target.store(src.src[0]))
       elif src.op in {Ops.BUFFER, Ops.UNSHARD} and src.has_buffer_identity(): placed[key] = target
       if key in placed:
@@ -55,7 +55,7 @@ def found_after(ctx:dict[UOp, UOp], after:UOp, src:UOp):
 # *** fold moved AFTERs (hack for openpilot) ***
 pm_fold_moved_after = PatternMatcher([
   (UPat(Ops.AFTER, src=(UPat(), UPat(Ops.STORE, src=(UPat(), UPat((*GroupOp.Movement,Ops.CAST,Ops.WHERE), name="src")))), name="after"), found_after),
-  # contiguous is also a materialization point (it bufferizes in the scheduler)
+  # a STAGE is also a materialization point
   (UPat(Ops.STAGE, src=(UPat((*GroupOp.Movement,Ops.CAST,Ops.WHERE), name="src"),), name="after"), found_after),
   # replace ALU sources with AFTER versions found above
   (UPat(GroupOp.ALU, name="alu"), lambda ctx,alu: alu.replace(src=new_src) if (new_src:=tuple(ctx.get(s, s) for s in alu.src)) != alu.src else None),

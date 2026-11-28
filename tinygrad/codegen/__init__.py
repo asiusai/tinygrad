@@ -4,8 +4,9 @@ import itertools, functools, time, inspect
 from tinygrad.helpers import DISABLE_FAST_IDIV, TRANSCENDENTAL, SPEC, CHECK_OOB, DEBUG, VIZ, IMAGE, NOOPT, EMULATED_DTYPES, USE_TC, SCACHE, BASEDIR
 from tinygrad.helpers import ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT, TC_SELECT, TC_OPT, TC_MIN_GLOBALS, TracingKey, Context, panic, cpu_profile, prod
 from tinygrad.helpers import all_same, argsort, partition, to_function_name, dedup, all_int, diskcache_get, diskcache_put, colored, NO_MEMORY_PLANNER
+from tinygrad.helpers import strides_for_shape
 from tinygrad.uop.ops import PatternMatcher, graph_rewrite, MapCtx, UOp, Ops, UPat, rewrite_group, KernelInfo, ProgramInfo, GroupOp, AxisType
-from tinygrad.uop.ops import UOpMetaClass, gate_kernel_sink, identity_element, _broadcast_shape, pm_resolve_params, pm_flatten_linear
+from tinygrad.uop.ops import UOpMetaClass, gate_kernel_sink, identity_element, _broadcast_shape, pm_resolve_params, pm_flatten_linear, StageOpts
 from tinygrad.uop.weak import pm_lower_weak, pm_commit_weak, pm_cast_const
 from tinygrad.uop.uir import render_uir
 from tinygrad.uop.spec import type_verify, spec_tensor, spec_program
@@ -29,7 +30,7 @@ from tinygrad.codegen.indexing import _stack_select
 from tinygrad.codegen.late.linearizer import CFGContext, pm_split_ends, pm_add_control_flow, linearize
 from tinygrad.codegen.late.regalloc import LinearScanRegallocContext, pm_regalloc_rewrite
 from tinygrad.codegen.late.coalesce import indexing_simplify, memory_coalescing, pm_simplify_add_image
-from tinygrad.codegen.rangeify import BufferizeOpts, get_kernel_graph
+from tinygrad.codegen.rangeify import get_kernel_graph
 from tinygrad.codegen.memory import memory_plan_rewrite
 
 def do_number_param(ctx:tuple[int, dict[str, int]], x:UOp): # after the params, one slot per name
@@ -111,15 +112,18 @@ def index_lanes(x:UOp) -> list[UOp]:
   if x.max_numel() == 0: return []
   if x.op is Ops.RESHAPE and all_int(x.src[0].shape): return index_lanes(x.src[0])
   if x.op is Ops.EXPAND: return index_lanes(x.src[0]) * int(prod(x.marg))
+  if x.op is Ops.PERMUTE:
+    lanes, shape = index_lanes(x.src[0]), x.src[0].shape
+    offsets = [[i*st for i in range(sz)] for sz,st in zip(shape, strides_for_shape(shape))]
+    return [lanes[sum(idx)] for idx in itertools.product(*(offsets[a] for a in x.marg))]
   if not x.shape: return [x]
   return [x.index(*idx) for idx in itertools.product(*map(range, x.shape))]
 
 def do_devectorize(b:UOp):
   if b.shape == (): return None
-  # broadcasting needs to be already unpacked, Invalid matches any dtype and shape
-  if not all(x.shape == b.shape or x.base.is_invalid for x in b.src): return None
-  lanes = [[x.base] * b.max_numel() if x.base.is_invalid else index_lanes(x) for x in b.src]
-  src = [b.replace(src=values) for values in zip(*lanes, strict=True)]
+  # broadcasting needs to be already unpacked
+  if not all(x.shape == b.shape for x in b.src): return None
+  src = [b.replace(src=values) for values in zip(*map(index_lanes, b.src), strict=True)]
   return UOp.stack(*src).reshape(b.shape) if b.op is not Ops.STORE else UOp.group(*src)
 
 def do_stack_wmma(u:UOp):
@@ -155,7 +159,7 @@ def fix_group_for_reduce(x:UOp):
   # do only the non grouped reduces early
   ret = x.replace(src=(x.src[0],)+tuple(reduce_r))
   reduce_weak = [x.replace(arg=(AxisType.WEAK, x.axis_id[0]+100, *x.axis_id[1:])) for x in reduce_gfr]
-  buf = ret.bufferize(*reduce_gfr, arg=BufferizeOpts(None, AddrSpace.LOCAL)).index(*reduce_weak)
+  buf = ret.stage(*reduce_gfr, arg=StageOpts(None, AddrSpace.LOCAL)).index(*reduce_weak)
 
   # do the final reduce (if/barrier are added in gpudims step)
   # NOTE: we remove all horizontal reduces here, they remain in the first reduce
@@ -320,7 +324,7 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   # do memory coalescing (late)
   sink = memory_coalescing(sink, ren)
   # an image is read_only or write_only, so a PARAM that is both loaded and stored stays a buffer
-  loaded, stored = [{u.src[0].buf_uop for u in sink.toposort() if u.op is op} for op in (Ops.LOAD, Ops.STORE)]
+  loaded, stored = [{u.src[0].buf_uop for u in sink.backward_slice if u.op is op} for op in (Ops.LOAD, Ops.STORE)]
   sink = graph_rewrite(sink, pm_simplify_add_image, name="add images", ctx=({}, ren, loaded & stored), bottom_up=True)
 
   # extra symbolic before decomp. crashes without this?
@@ -418,7 +422,7 @@ class LowerCallsCtx:
 
 def lower_call(ctx:LowerCallsCtx, call:UOp, b:UOp) -> UOp|None:
   if b.op is Ops.PROGRAM and b.src[-1].op is Ops.BINARY: return None
-  bodies = ctx.names.setdefault(name:=to_function_name(call.arg.name), {})
+  bodies = ctx.names.setdefault(name:=to_function_name((b.src[0].arg if b.op is Ops.PROGRAM else b.arg).name), {})
   ki = KernelInfo(name + (f"_{i}" if (i:=bodies.setdefault(b, len(bodies))) else ""), optimized=True, kernel=False)
   if ctx.renderer.inline_prefix:
     b = graph_rewrite(b, pm_lower_calls, ctx=ctx, name="lower calls", walk=True)
@@ -720,7 +724,7 @@ def create_linear(fn:UOp) -> UOp:
   fn = fn.substitute({v:v.param_like(i) for v,i in views.items()}, walk=True, name="views to params")
   linear_call = graph_rewrite(fn.call(*views, precompile=True), pm_schedule, name="schedule to linear", enter_calls=True)
 
-  # this recursively resolves the linear_call, storage stays unbound until map back
+  # this recursively resolves the linear_call, storage stays unbound until link
   linear = graph_rewrite(linear_call, pm_resolve_linear_call, name="resolve linear call")
 
   # create copies
@@ -729,8 +733,9 @@ def create_linear(fn:UOp) -> UOp:
   # plan the storage the function allocates
   linear = memory_plan_rewrite(linear)
 
-  # the storage it allocates gets canonical slots, so the linear only depends on fn. map back binds each to fresh storage
+  # the storage it allocates gets canonical slots, so the linear only depends on fn. link binds each to fresh storage
   allocs = [u for u in linear.toposort() if u.op is Ops.ALLOC and u.addrspace is AddrSpace.GLOBAL]
+  if any(b.device is None for b in allocs): raise RuntimeError("global storage needs a device, give the ALLOC one")
   ret = linear.substitute({b:b.replace(arg=replace(b.arg, slot=-1-i)) for i,b in enumerate(allocs)}, walk=True, name="canonical alloc slots")
   if SCACHE: schedule_cache[key] = ret
   return ret
