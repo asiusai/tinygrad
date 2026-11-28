@@ -130,16 +130,22 @@ class QCOMComputeQueue(HWQueue):
     args_addr, lib_addr = self.kernargs(call, prg, data).getaddr(self.devs), lib.getaddr(self.devs)
     stack_addr = UOp.extern((data.stack_size,), dtypes.uint8, self.devs[0], "stack").getaddr(self.devs)
 
+    # KGSL (dev_info is None) keeps the stock command stream. MSM uses the device limits reported by Mesa.
+    has_lpac = data.dev_info is not None and data.dev_info.a6xx.has_lpac
+    supports_double_threadsize = data.dev_info is None or data.dev_info.a6xx.supports_double_threadsize
     threadsize = mesa.THREAD128 if data.double_threadsize else mesa.THREAD64
-    supports_double_threadsize = data.dev_info.a6xx.supports_double_threadsize
     wge_threadsize = threadsize if supports_double_threadsize else mesa.THREAD128
     const_ram_mode = mesa.CONSTLEN_512 if data.constlen > 256 else \
                      mesa.CONSTLEN_256 if data.constlen > 192 else \
                      mesa.CONSTLEN_192 if data.constlen > 128 else mesa.CONSTLEN_128
 
     self.cmd(mesa.CP_SET_MARKER, qreg.a6xx_cp_set_marker_0(mode=mesa.RM6_COMPUTE))
-    self.reg(mesa.REG_A6XX_SP_UPDATE_CNTL, qreg.a6xx_sp_update_cntl(vs_state=True, hs_state=True, ds_state=True, gs_state=True,
-                                                                   fs_state=True, cs_state=True, cs_uav=True, gfx_uav=True))
+    if data.dev_info is None:
+      self.reg(mesa.REG_A6XX_SP_UPDATE_CNTL, qreg.a6xx_sp_update_cntl(cs_state=True, cs_uav=True))
+      self.reg(mesa.REG_A6XX_SP_UPDATE_CNTL, 0x0)
+    else:
+      self.reg(mesa.REG_A6XX_SP_UPDATE_CNTL, qreg.a6xx_sp_update_cntl(vs_state=True, hs_state=True, ds_state=True, gs_state=True,
+                                                                     fs_state=True, cs_state=True, cs_uav=True, gfx_uav=True))
     self.reg(mesa.REG_A6XX_SP_CS_TSIZE, qreg.a6xx_sp_cs_tsize(0x80)) # is this right? mesa uses 1
     self.reg(mesa.REG_A6XX_SP_CS_USIZE, qreg.a6xx_sp_cs_usize(0x40)) # mesa also uses 1
     self.reg(mesa.REG_A6XX_SP_MODE_CNTL, qreg.a6xx_sp_mode_cntl(isammode=mesa.ISAMMODE_GL if data.NIR else mesa.ISAMMODE_CL,
@@ -161,7 +167,7 @@ class QCOMComputeQueue(HWQueue):
              0, data.prg_offset, lib_addr,
              qreg.a6xx_sp_cs_pvt_mem_param(memsizeperitem=data.pvtmem_size_per_item), stack_addr,
              qreg.a6xx_sp_cs_pvt_mem_size(totalpvtmemsize=data.pvtmem_size_total, perwavememlayout=data.pvtmem_per_wave))
-    if data.dev_info.a6xx.has_lpac:
+    if has_lpac:
       self.reg(mesa.REG_A6XX_HLSQ_CS_CTRL_REG1,
                qreg.a6xx_hlsq_cs_ctrl_reg1(constantrammode=const_ram_mode, shared_size=data.shared_size))
     if not supports_double_threadsize:
@@ -174,7 +180,7 @@ class QCOMComputeQueue(HWQueue):
                                                              state_block=mesa.SB6_CS_SHADER, num_unit=ceildiv(data.image_size, 128)), lib_addr)
 
     self.reg(mesa.REG_A6XX_SP_REG_PROG_ID_0, 0xfcfcfcfc, 0xfcfcfcfc, 0xfcfcfcfc, 0xfc,
-             qreg.a6xx_sp_cs_const_config(constlen=ceildiv(data.constlen, 4), enabled=True))
+             qreg.a6xx_sp_cs_const_config(constlen=1024 // 4 if data.dev_info is None else ceildiv(data.constlen, 4), enabled=True))
 
     self.reg(mesa.REG_A6XX_SP_CS_PVT_MEM_STACK_OFFSET, qreg.a6xx_sp_cs_pvt_mem_stack_offset(data.hw_stack_offset))
     # image_size is in bytes, but INSTR_SIZE is measured in units of instruction groups (16 instructions, 8 bytes each)
@@ -204,7 +210,7 @@ class QCOMComputeQueue(HWQueue):
       self.reg(mesa.REG_A6XX_SP_CS_CONST_CONFIG_0,
                qreg.a6xx_sp_cs_const_config_0(wgidconstid=data.wgid, wgsizeconstid=data.wgsz, wgoffsetconstid=0xfc, localidregid=data.lid),
                qreg.a6xx_sp_cs_wge_cntl(linearlocalidregid=0xfc, threadsize=wge_threadsize))
-      if data.dev_info.a6xx.has_lpac:
+      if has_lpac:
         self.reg(mesa.REG_A6XX_SP_CS_WIE_CNTL_0,
                  qreg.a6xx_sp_cs_wie_cntl_0(wgidconstid=data.wgid, wgsizeconstid=data.wgsz, wgoffsetconstid=0xfc, localidregid=data.lid),
                  qreg.a6xx_sp_cs_wie_cntl_1(linearlocalidregid=0xfc, threadsize=threadsize))
@@ -223,11 +229,15 @@ class QCOMComputeQueue(HWQueue):
 
 class QCOMProgramData:
   def __init__(self, dev:str, obj:TinyELF):
-    from tinygrad.runtime.support.compiler_mesa import IR3Compiler
     self.signature, self.name, self.NIR = obj.signature, obj.name, isinstance(Device.renderer_for(dev), IR3Renderer)
-    self.dev_info = mesa.fd_dev_info(IR3Compiler.device_id(Device.target_for(dev).arch))
+    # Only mainline (MSM) needs the Mesa device limits. KGSL must not require libtinymesa for OpenCL programs.
+    self.dev_info: Any = None
+    if (target:=Device.target_for(dev)).interface == "MSM":
+      from tinygrad.runtime.support.compiler_mesa import IR3Compiler
+      self.dev_info = mesa.fd_dev_info(IR3Compiler.device_id(target.arch))
 
     if self.NIR:
+      from tinygrad.runtime.support.compiler_mesa import IR3Compiler
       v, cs, imm_vals, self.image = IR3Compiler.unpack_lib(obj.lib)
       self.prg_offset, self.brnchstck, self.image_size, self.pvtmem, self.shmem = 0, v.branchstack, v.info.size, v.pvtmem_size, v.shared_size
       self.constlen, self.pvtmem_per_wave = v.constlen, v.pvtmem_per_wave
@@ -253,8 +263,16 @@ class QCOMProgramData:
       self.constlen, self.pvtmem_per_wave = 256, False
       self.double_threadsize = self.early_preamble = self.mergedregs = False
 
-    self.pvtmem_size_per_item, self.pvtmem_size_total, self.hw_stack_offset, self.stack_size = \
-      _qcom_pvtmem_sizes(self.pvtmem, self.dev_info.fibers_per_sp, self.dev_info.num_sp_cores)
+    if self.dev_info is None:
+      self.constlen, self.pvtmem_per_wave = 256, False
+      self.double_threadsize = self.early_preamble = self.mergedregs = False
+      self.pvtmem_size_per_item: int = round_up(self.pvtmem, 512) >> 9
+      self.pvtmem_size_total: int = self.pvtmem_size_per_item * 128 * 2
+      self.hw_stack_offset: int = round_up(next_power2(round_up(self.pvtmem, 512)) * 128 * 16, 0x1000)
+      self.stack_size: int = self.hw_stack_offset * 4
+    else:
+      self.pvtmem_size_per_item, self.pvtmem_size_total, self.hw_stack_offset, self.stack_size = \
+        _qcom_pvtmem_sizes(self.pvtmem, self.dev_info.fibers_per_sp, self.dev_info.num_sp_cores)
     self.shared_size: int = max(1, (self.shmem - 1) // 1024)
     self.max_threads = min(1024, ((384 * 32) // (max(1, (self.fregs + round_up(self.hregs, 2) // 2)) * 128)) * 128)
     self.kernargs_alloc_size = round_up(2048 + (self.tex_cnt + self.ibo_cnt) * 0x40 + len(self.samplers) * 4, 0x100)
@@ -479,7 +497,9 @@ class QCOMDevice(Compiled):
     if PROFILE and isinstance(self.iface, KGSLIface):
       System.write_sysfs("/sys/class/kgsl/kgsl-3d0/idle_timer", value="4000000000", msg="Failed to disable suspend mode", expected="4294967276")
 
-    arch = ("a%d%d%d,GPU_ID=%d,CHIP_ID=%#x" % (*self.gpu_id, mesa_gpu_id, self.iface.chip_id)) + (",IMAGE_PITCH_ALIGNMENT=64" if IMAGE else "")
+    arch = "a%d%d%d" % self.gpu_id
+    if isinstance(self.iface, MSMIface): arch += ",GPU_ID=%d,CHIP_ID=%#x" % (mesa_gpu_id, self.iface.chip_id)
+    arch += ",IMAGE_PITCH_ALIGNMENT=64" if IMAGE else ""
     super().__init__(device, QCOMAllocator(self), None, arch=arch, props={"copy": 0})
 
     self.var_vals = {to_name(self.device, "fd"): self.iface.fd.fd, to_name(self.device, "ctx"): self.iface.ctx}

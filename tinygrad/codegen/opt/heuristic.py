@@ -92,8 +92,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # if there are small dims with lots of valid masks, upcast them (they might be from Tensor.stack)
   to_upcast: list[int] = []
-  # Limit IR3 register pressure on Adreno until larger unrolls pass workload tests.
-  masked_upcast_max = 1 if k.ren.target.device == "QCOM" else 7 * 7
+  # Limit IR3 register pressure on mainline (MSM) Adreno until larger unrolls pass workload tests. KGSL keeps the stock limits.
+  qcom_msm = k.ren.target.device == "QCOM" and k.ren.target.interface == "MSM"
+  masked_upcast_max = 1 if qcom_msm else 7 * 7
   where_gate_rngs = {r for u in k.ast.backward_slice if u.op is Ops.WHERE for r in u.src[0].ranges}
   # upcast leading axes first (hack-ish for winograd; we actually want to upcast masked axes with low stride first)
   for axis in k.upcastable_dims():
@@ -141,11 +142,11 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # if last reduce dim is small(ish), loop unroll the reduce
   # NOTE: this can fail on multireduce with mismatching dimensions, this is okay
   try:
-    qcom_has_unroll = k.ren.target.device == "QCOM" and bool(k.axes_of(AxisType.UPCAST, reduce=True))
+    qcom_has_unroll = qcom_msm and bool(k.axes_of(AxisType.UPCAST, reduce=True))
     if (axes:=k.upcastable_dims(reduce=True)) and not qcom_has_unroll and \
         (k.upcast_size() <= 4 or not k.axes_of(AxisType.UPCAST, reduce=True)) and k.upcast_size() < 64:
       if (s:=k.full_shape[axes[-1]]) <= 32:
-        if s <= (8 if k.ren.target.device == "QCOM" else 32):
+        if s <= (8 if qcom_msm else 32):
           k.apply_opt(Opt(OptOps.SPLIT, axes[-1], (0, AxisType.UPCAST)))
         elif s % 4 == 0:
           k.apply_opt(Opt(OptOps.SPLIT, axes[-1], (4, AxisType.UPCAST)))
